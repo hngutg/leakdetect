@@ -1,0 +1,70 @@
+# LeakDetect 配置文件
+# 对应文档：D:\leakdetect-plan.md §5.3、§5.4
+
+server:
+  host: 127.0.0.1       # Web 监听地址（127.0.0.1 仅本机；0.0.0.0 局域网开放）
+  port: 8080
+
+monitoring:
+  # 启动预指定容器（可选）
+  # null = 全量监控；填 container_id 则启动即聚焦该容器
+  # Web 切换会运行时覆盖此配置
+  target_container_id: null
+
+filter:
+  # 黑白名单（抓取层过滤，对应 §5.4）
+  # mode: disabled（全部监控）| whitelist（仅监控列出的）| blacklist（监控除列出外的）
+  mode: disabled
+  name_regex: ""         # 进程名正则，多个用 | 分隔，如 "nginx|mysql|redis"
+  pid_list: []           # PID 列表，如 [1234, 5678]
+  # 匹配逻辑：进程名 OR PID 命中即视为匹配
+  refresh_interval: 30   # 重新解析 name_regex 的间隔（秒），因进程会启停
+
+thresholds:
+  # 泄露判定阈值（对应文档 §6.1）
+  mem:
+    outstanding_delta_bytes: 1048576   # 1MB，告警增量阈值
+    alloc_free_diff: 10000            # alloc_count - free_count 差值
+    observe_seconds: 30               # 观察期时长（normal→observing）
+    leak_seconds: 60                  # 确认泄露时长（observing→leak_suspected）
+    clear_ratio: 0.5                  # 恢复阈值（峰值百分比，leak→resolved）
+    clear_seconds: 30                 # 恢复确认时长
+    resolve_seconds: 60               # 清除时长（resolved→normal）
+    stabilize_seconds: 300            # 内存稳定后自动消除告警的时长（秒）
+  thread:
+    delta_threshold: 5                # 5 个线程增量
+    observe_seconds: 30
+    leak_seconds: 120                 # 确认泄露时长
+    clear_ratio: 0.5
+    clear_seconds: 30
+    resolve_seconds: 60
+    stabilize_seconds: 300
+  fd:
+    delta_threshold: 10               # 10 个 fd 增量
+    observe_seconds: 30
+    leak_seconds: 120
+    clear_ratio: 0.5
+    clear_seconds: 30
+    resolve_seconds: 60
+    stabilize_seconds: 300
+
+sampling:
+  mem: 100              # 每 100 次 malloc 抓 1 次（高频，需采样）
+  thread: 1             # 全量（低频）
+  fd: 1                 # 全量（低频）
+  cpu_interval: 1       # /proc 轮询间隔（秒）
+
+# 历史数据采样与存储（对应前端文档 §7.2）
+history:
+  ranges:
+    "1d": { interval: 60, points: 1440 }      # 1分钟采样，1440点
+    "7d": { interval: 600, points: 1008 }     # 10分钟降采样
+    "30d": { interval: 1800, points: 1440 }   # 30分钟降采样
+  retention_days: 30   # 历史数据保留天数
+
+storage:
+  sqlite_path: data/leakdetect.db
+
+logging:
+  alert_log: data/leakdetect.log
+  level: INFO

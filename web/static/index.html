@@ -1,0 +1,126 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LeakDetect</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- 顶部栏 -->
+        <div class="header">
+            <h1>LeakDetect</h1>
+            <div class="filter-controls">
+                <select v-model="selectedContainer" @change="onContainerChange" class="filter-select">
+                    <option :value="null">全部容器</option>
+                    <option v-for="c in containers" :key="c.id" :value="c.id">{{ c.name }}</option>
+                </select>
+                <input v-model="pidInput" placeholder="输入PID" @keyup.enter="applyPidFilter" class="filter-input">
+                <button @click="applyPidFilter" class="filter-btn">应用</button>
+                <button @click="clearFilters" class="filter-btn">清除</button>
+            </div>
+            <div class="status">
+                <span :class="{ 'status-ok': connected, 'status-err': !connected }">
+                    {{ connected ? '● 运行中' : '● 断开' }}
+                </span>
+                <span class="last-update" v-if="lastUpdate">更新: {{ lastUpdate }}</span>
+                <button @click="openFilterConfig" class="btn-config">监控配置</button>
+            </div>
+        </div>
+
+        <!-- 资源卡片网格 -->
+        <div class="resource-grid">
+            <div v-for="r in resourceOrder" :key="r"
+                 class="resource-card" :class="resources[r].status">
+                <div class="card-header">
+                    <span class="card-title">{{ resourceLabel(r) }}</span>
+                    <span class="status-badge" :class="resources[r].status">
+                        {{ statusText(resources[r].status) }}
+                    </span>
+                </div>
+                <div class="card-current">
+                    {{ formatValue(r, resources[r].current) }}
+                </div>
+                <line-chart
+                    :series="chartData[r].series"
+                    :resource="r"
+                    :range="chartData[r].range"
+                    @range-change="switchRange(r, $event)">
+                </line-chart>
+                <table class="process-table" v-if="filteredPerProcess[r].length">
+                    <tr v-for="p in filteredPerProcess[r]" :key="p.pid">
+                        <td>{{ p.name }} ({{ p.pid }})</td>
+                        <td>{{ formatValue(r, p.value) }}</td>
+                        <td v-if="p.delta_60s">{{ formatValue(r, p.delta_60s) }}/60s</td>
+                        <td v-else></td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+
+        <!-- 告警区 -->
+        <div class="alert-section">
+            <div class="alert-list">
+                <div class="alert-tabs">
+                    <button @click="switchAlertTab('current')" :class="{active: alertTab === 'current'}">
+                        当前告警 ({{ filteredAlerts.length }})
+                    </button>
+                    <button @click="switchAlertTab('history')" :class="{active: alertTab === 'history'}">
+                        历史告警
+                    </button>
+                </div>
+
+                <!-- 当前告警 -->
+                <template v-if="alertTab === 'current'">
+                    <div v-if="filteredAlerts.length === 0" class="no-alerts">✓ 无告警</div>
+                    <div v-for="a in filteredAlerts" :key="a.id" class="alert-item"
+                         :class="[a.severity, {selected: selectedAlert && selectedAlert.id === a.id}]"
+                         @click="selectAlert(a)">
+                        <span class="alert-type">{{ resourceLabel(a.resource) }}泄露</span>
+                        <span class="alert-pid">PID:{{ a.pid }}</span>
+                        <span class="alert-name">{{ a.process_name }}</span>
+                        <div class="alert-detail">{{ a.detail }}</div>
+                        <div class="alert-time">{{ formatTime(a.timestamp) }}</div>
+                    </div>
+                </template>
+
+                <!-- 历史告警 -->
+                <template v-if="alertTab === 'history'">
+                    <div v-if="historyLoading" class="loading">加载中...</div>
+                    <div v-else-if="historyAlerts.length === 0" class="no-alerts">✓ 无历史告警</div>
+                    <div v-for="a in historyAlerts" :key="a.id" class="alert-item"
+                         :class="[a.severity, {selected: selectedAlert && selectedAlert.id === a.id}]"
+                         @click="selectAlert(a)">
+                        <span class="alert-type">{{ resourceLabel(a.resource) }}泄露</span>
+                        <span class="alert-pid">PID:{{ a.pid }}</span>
+                        <span class="alert-name">{{ a.process_name }}</span>
+                        <div class="alert-detail">{{ a.detail }}</div>
+                        <div class="alert-time">{{ formatTime(a.timestamp) }}</div>
+                    </div>
+                </template>
+            </div>
+
+            <!-- StackView 组件 -->
+            <stack-view :alert="selectedAlert"></stack-view>
+        </div>
+
+        <!-- 黑白名单配置弹窗 -->
+        <filter-config-modal :visible="filterConfigVisible" @close="closeFilterConfig">
+        </filter-config-modal>
+    </div>
+
+    <!-- Vendor 库（本地存，无需联网；顺序重要） -->
+    <script src="/static/vendor/socket.io.min.js"></script>
+    <script src="/static/vendor/vue.global.prod.js"></script>
+    <script src="/static/vendor/chart.umd.min.js"></script>
+    <script src="/static/vendor/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <!-- 组件 -->
+    <script src="/static/js/components/line-chart.js"></script>
+    <script src="/static/js/components/stack-view.js"></script>
+    <script src="/static/js/components/filter-config.js"></script>
+    <!-- 应用代码 -->
+    <script src="/static/js/api.js"></script>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

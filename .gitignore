@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# BPF 编译产物
+bpf/compiled/*.o
+
+# 运行时产物
+data/*.db
+data/*.db-journal
+*.log
+config/runtime.yaml
+
+# 打包产物
+dist/
+build/
+*.spec.bak
+
+# 前端 vendor 下载临时文件
+web/static/vendor/*.tmp
