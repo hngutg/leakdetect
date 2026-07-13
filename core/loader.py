@@ -168,12 +168,16 @@ class BpfLoader:
             raise RuntimeError("Failed to attach kprobe %s:%s" % (prog_name, func_name))
         print("[loader] kprobe %s:%s attached" % (prog_name, func_name))
 
-    def _attach_tp(self, resource, prog_name, category, event):
-        """attach tracepoint。"""
+    def _attach_tp(self, resource, prog_name, category, event, optional=False):
+        """attach tracepoint。optional=True 时失败只 warning 不 raise。"""
         prog = self._find_prog(resource, prog_name)
         link = libbpf.bpf_program__attach_tracepoint(
             prog, category.encode("utf-8"), event.encode("utf-8"))
         if not link:
+            if optional:
+                print("[loader] WARNING: tracepoint %s:%s/%s not available, skipping" % (
+                    prog_name, category, event))
+                return
             raise RuntimeError("Failed to attach tracepoint %s:%s/%s" % (
                 prog_name, category, event))
         print("[loader] tracepoint %s:%s/%s attached" % (prog_name, category, event))
@@ -222,8 +226,8 @@ class BpfLoader:
         self._load_obj("fd", "fd.o")
         self._attach_kprobe("fd", "trace_fd_install", "fd_install")
         self._attach_tp("fd", "trace_close", "syscalls", "sys_enter_close")
-        self._attach_tp("fd", "trace_dup2", "syscalls", "sys_enter_dup2")
-        self._attach_tp("fd", "trace_dup3", "syscalls", "sys_enter_dup3")
+        self._attach_tp("fd", "trace_dup2", "syscalls", "sys_enter_dup2", optional=True)
+        self._attach_tp("fd", "trace_dup3", "syscalls", "sys_enter_dup3", optional=True)
         print("[loader] fd kprobe + tracepoints attached")
 
     def start_event_loop(self, callbacks):
