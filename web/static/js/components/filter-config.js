@@ -1,12 +1,8 @@
-// FilterConfigModal 组件 - 黑白名单配置弹窗
-// 对应里程碑：F3
-// 对应文档：leakdetect-f3-design.md §3.3
+// ConfigPage 组件 - 进程管理配置页面（全屏页面，非模态弹窗）
+// 支持白名单导入导出，不含黑名单
 
-const FilterConfigModal = {
-  props: {
-    visible: { type: Boolean, default: false },
-  },
-  emits: ['close'],
+const ConfigPage = {
+  emits: ['back'],
   data() {
     return {
       mode: 'disabled',
@@ -18,15 +14,16 @@ const FilterConfigModal = {
     };
   },
   template: `
-    <div v-if="visible" class="modal-overlay" @click.self="$emit('close')">
-      <div class="modal-dialog">
-        <h3>监控配置</h3>
-
+    <div class="config-page">
+      <div class="config-header">
+        <button @click="$emit('back')" class="btn-back">← 返回</button>
+        <h2>进程管理配置</h2>
+      </div>
+      <div class="config-body">
         <div class="form-group">
           <label>过滤模式：</label>
           <label class="radio-label"><input type="radio" v-model="mode" value="disabled"> 全部监控</label>
           <label class="radio-label"><input type="radio" v-model="mode" value="whitelist"> 白名单</label>
-          <label class="radio-label"><input type="radio" v-model="mode" value="blacklist"> 黑名单</label>
         </div>
 
         <div class="form-group" v-if="mode !== 'disabled'">
@@ -60,8 +57,14 @@ const FilterConfigModal = {
           </div>
         </div>
 
+        <div class="config-import-export">
+          <input type="file" ref="fileInput" style="display:none" accept=".json" @change="doImport">
+          <button @click="$refs.fileInput.click()" class="btn-import">导入配置</button>
+          <button @click="doExport" class="btn-export">导出配置</button>
+        </div>
+
         <div class="modal-footer">
-          <button @click="$emit('close')">取消</button>
+          <button @click="$emit('back')">取消</button>
           <button @click="doSave" :disabled="saving" class="btn-primary">
             {{ saving ? '保存中...' : '保存并应用' }}
           </button>
@@ -69,20 +72,25 @@ const FilterConfigModal = {
       </div>
     </div>
   `,
-  watch: {
-    visible(val) {
-      if (val) {
-        this.loadConfig();
-      } else {
-        this.preview = null;
-      }
-    },
+  mounted() {
+    this.loadConfig();
   },
   methods: {
+    parsePids() {
+      var pids = [];
+      var parts = this.pidListText.split(',');
+      for (var i = 0; i < parts.length; i++) {
+        var n = parseInt(parts[i].trim());
+        if (!isNaN(n)) pids.push(n);
+      }
+      return pids;
+    },
+
     async loadConfig() {
       try {
         var resp = await LeakDetectAPI.getFilterConfig();
         this.mode = resp.mode || 'disabled';
+        if (this.mode === 'blacklist') this.mode = 'whitelist';
         this.nameRegex = resp.name_regex || '';
         this.pidListText = (resp.pid_list || []).join(', ');
       } catch (e) {
@@ -103,22 +111,54 @@ const FilterConfigModal = {
     async doSave() {
       this.saving = true;
       try {
-        var pids = [];
-        var parts = this.pidListText.split(',');
-        for (var i = 0; i < parts.length; i++) {
-          var n = parseInt(parts[i].trim());
-          if (!isNaN(n)) pids.push(n);
-        }
         await LeakDetectAPI.saveFilterConfig({
           mode: this.mode,
           name_regex: this.nameRegex,
-          pid_list: pids,
+          pid_list: this.parsePids(),
         });
-        this.$emit('close');
+        this.$emit('back');
       } catch (e) {
         console.error('[filter] save failed:', e);
       }
       this.saving = false;
+    },
+
+    doExport() {
+      var config = {
+        mode: this.mode,
+        name_regex: this.nameRegex,
+        pid_list: this.parsePids(),
+      };
+      var blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = 'leakdetect-whitelist.json';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    },
+
+    doImport(event) {
+      var file = event.target.files[0];
+      if (!file) return;
+      var self = this;
+      var reader = new FileReader();
+      reader.onload = function(e) {
+        try {
+          var config = JSON.parse(e.target.result);
+          self.mode = config.mode || 'disabled';
+          if (self.mode === 'blacklist') self.mode = 'whitelist';
+          self.nameRegex = config.name_regex || '';
+          self.pidListText = (config.pid_list || []).join(', ');
+          self.preview = null;
+        } catch (err) {
+          alert('导入失败：文件格式不正确');
+        }
+      };
+      reader.readAsText(file);
+      event.target.value = '';
     },
   },
 };

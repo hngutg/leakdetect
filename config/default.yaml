@@ -2,7 +2,11 @@
 # 对应文档：D:\leakdetect-plan.md §5.3、§5.4
 
 server:
-  host: 127.0.0.1       # Web 监听地址（127.0.0.1 仅本机；0.0.0.0 局域网开放）
+  # 监听地址（无认证；非 127.0.0.1 会暴露到网络，需放行端口）：
+  #   "::"        = IPv6 双栈（默认；双栈内核下同时收 IPv4+IPv6，绑不了自动回退 0.0.0.0）
+  #   "0.0.0.0"   = 仅 IPv4 所有网卡
+  #   "127.0.0.1" = 仅本机（需 SSH 隧道，最安全）
+  host: "::"
   port: 8080
 
 monitoring:
@@ -12,8 +16,8 @@ monitoring:
   target_container_id: null
 
 filter:
-  # 黑白名单（抓取层过滤，对应 §5.4）
-  # mode: disabled（全部监控）| whitelist（仅监控列出的）| blacklist（监控除列出外的）
+  # 白名单过滤（抓取层过滤，对应 §5.4）
+  # mode: disabled（全部监控）| whitelist（仅监控列出的）
   mode: disabled
   name_regex: ""         # 进程名正则，多个用 | 分隔，如 "nginx|mysql|redis"
   pid_list: []           # PID 列表，如 [1234, 5678]
@@ -22,27 +26,38 @@ filter:
 
 thresholds:
   # 泄露判定阈值（对应文档 §6.1）
+  # 精度专项（2026-08-21）：阈值语义从 delta(字节/计数) → 斜率(单位/秒)
+  # 配合 OLS 斜率 + 显著性判定（analyzer/base.py _is_leaking）
   mem:
-    outstanding_delta_bytes: 1048576   # 1MB，告警增量阈值
-    alloc_free_diff: 10000            # alloc_count - free_count 差值
+    outstanding_delta_bytes: 10240     # 斜率地板 bytes/sec：净增长超此速率才可能告警（默认 10KB/s；mem_leak 40KB/s 命中）
+    alloc_free_diff: 10000            # vestigial，未使用
+    significance_z: 3.0               # 斜率/SE 显著性阈值（自相关使 t 虚高，3.0 实效≈2.1）
+    grace_seconds: 120                # 启动宽限：新进程前 N 秒只攒历史不判定
+    confirm_seconds: 240             # 疑似→确认：LEAK 持续此时长且仍 leaking 才升 confirmed（=2×leak_seconds，spurious 已老化）
     observe_seconds: 30               # 观察期时长（normal→observing）
-    leak_seconds: 60                  # 确认泄露时长（observing→leak_suspected）
+    leak_seconds: 60                  # 趋势检测窗口；history 保留 2×此时长，斜率在此窗口算
     clear_ratio: 0.5                  # 恢复阈值（峰值百分比，leak→resolved）
     clear_seconds: 30                 # 恢复确认时长
     resolve_seconds: 60               # 清除时长（resolved→normal）
     stabilize_seconds: 300            # 内存稳定后自动消除告警的时长（秒）
   thread:
-    delta_threshold: 5                # 5 个线程增量
+    delta_threshold: 0.1               # 斜率地板 threads/sec（默认 0.1≈6个/分钟，需实测调）
+    significance_z: 3.0
+    grace_seconds: 120
+    confirm_seconds: 240
     observe_seconds: 30
-    leak_seconds: 120                 # 确认泄露时长
+    leak_seconds: 120                 # 趋势检测窗口
     clear_ratio: 0.5
     clear_seconds: 30
     resolve_seconds: 60
     stabilize_seconds: 300
   fd:
-    delta_threshold: 10               # 10 个 fd 增量
+    delta_threshold: 0.5               # 斜率地板 fd/sec（默认 0.5≈30个/分钟，需实测调）
+    significance_z: 3.0
+    grace_seconds: 120
+    confirm_seconds: 240
     observe_seconds: 30
-    leak_seconds: 120
+    leak_seconds: 120                 # 趋势检测窗口
     clear_ratio: 0.5
     clear_seconds: 30
     resolve_seconds: 60

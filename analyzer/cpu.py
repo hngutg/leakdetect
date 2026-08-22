@@ -55,4 +55,4 @@ class CpuMonitor:
 
         self._last = {pid: v for pid, v in self._last.items()
                       if os.path.exists("/proc/%d" % pid)}
-        return sorted(result, key=lambda x: x["value"], reverse=True)[:5]
+        return sorted(result, key=lambda x: x["value"], reverse=True)

@@ -25,8 +25,8 @@ from elftools.elf.elffile import ELFFile
 # ========== libbpf 加载 ==========
 
 def _load_libbpf():
-    """加载 libbpf 共享库。"""
-    for name in ("libbpf.so.1", "libbpf.so"):
+    """加载 libbpf 共享库（libbpf.so.1 → libbpf.so.0 → libbpf.so）。"""
+    for name in ("libbpf.so.1", "libbpf.so.0", "libbpf.so"):
         try:
             return ctypes.CDLL(name)
         except OSError:

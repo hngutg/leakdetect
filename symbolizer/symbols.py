@@ -95,15 +95,22 @@ class Symbolizer:
                     if not hasattr(section, "iter_symbols"):
                         continue
                     for sym in section.iter_symbols():
-                        if sym["st_info"]["type"] != "STT_FUNC":
+                        try:
+                            if sym["st_info"]["type"] != "STT_FUNC":
+                                continue
+                            if sym["st_value"] == 0 or sym["st_size"] == 0:
+                                continue
+                            name = sym.name
+                            if isinstance(name, bytes):
+                                name = name.decode("utf-8", errors="replace")
+                            symbols.append((sym["st_value"], sym["st_size"], name))
+                        except Exception:
                             continue
-                        if sym["st_value"] == 0 or sym["st_size"] == 0:
-                            continue
-                        symbols.append((sym["st_value"], sym["st_size"],
-                                        sym.name.decode("utf-8", errors="replace")
-                                        if isinstance(sym.name, bytes) else sym.name))
-        except Exception:
-            pass
+        except Exception as e:
+            print("[symbolizer] read %s failed: %s" % (elf_path, e))
+        else:
+            if not symbols:
+                print("[symbolizer] no STT_FUNC symbols in %s" % elf_path)
 
         self._elf_cache[elf_path] = symbols
         return symbols

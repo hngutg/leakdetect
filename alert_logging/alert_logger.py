@@ -21,13 +21,16 @@ class AlertLogger:
         """写入日志。"""
         with open(self.path, "a") as f:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            if alert["severity"] == "leak":
+            res = alert.get("resource", "?").upper()
+            sev = alert.get("severity", "")
+            if sev in ("suspected", "confirmed"):
                 stack_str = " → ".join(
                     frame.get("func", "?") for frame in alert.get("stack", []))
-                f.write("[%s] MEM LEAK PID=%d %s | %s | %s\n" % (
-                    ts, alert["pid"], alert.get("process_name", ""),
+                tag = "LEAK CONFIRMED" if sev == "confirmed" else "LEAK SUSPECTED"
+                f.write("[%s] %s %s PID=%d %s | %s | %s\n" % (
+                    ts, res, tag, alert["pid"], alert.get("process_name", ""),
                     alert["detail"], stack_str))
-            elif alert["severity"] == "resolved":
-                f.write("[%s] MEM RESOLVED PID=%d %s | %s\n" % (
-                    ts, alert["pid"], alert.get("process_name", ""),
+            elif sev == "resolved":
+                f.write("[%s] %s RESOLVED PID=%d %s | %s\n" % (
+                    ts, res, alert["pid"], alert.get("process_name", ""),
                     alert["detail"]))

@@ -67,7 +67,7 @@ class Aggregator:
                 comm = next(iter(stacks.values()))["comm"] if stacks else ""
                 result.append({"pid": pid, "name": comm,
                                "value": max(0, total) * 100, "delta_60s": 0})
-        return sorted(result, key=lambda x: x["value"], reverse=True)[:5]
+        return sorted(result, key=lambda x: x["value"], reverse=True)
 
     # ========== 线程（B2） ==========
 
@@ -100,7 +100,7 @@ class Aggregator:
             for pid, s in self.thread_stats.items():
                 count = max(0, s["created"] - s["exited"])
                 result.append({"pid": pid, "name": s["comm"], "value": count})
-        return sorted(result, key=lambda x: x["value"], reverse=True)[:5]
+        return sorted(result, key=lambda x: x["value"], reverse=True)
 
     # ========== 句柄（B2，per-PID 计数，与线程相同模式） ==========
 
@@ -132,7 +132,7 @@ class Aggregator:
             for pid, s in self.fd_stats.items():
                 count = max(0, s["open_count"] - s["close_count"])
                 result.append({"pid": pid, "name": s["comm"], "value": count})
-        return sorted(result, key=lambda x: x["value"], reverse=True)[:5]
+        return sorted(result, key=lambda x: x["value"], reverse=True)
 
     # ========== 通用 ==========
 

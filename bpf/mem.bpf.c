@@ -54,6 +54,38 @@ int trace_malloc_entry(struct pt_regs *ctx) {
                             sizeof(info.stack_addrs), BPF_F_USER_STACK);
     info.stack_cnt = (ret >= 0) ? ret / (int)sizeof(u64) : 0;
     if (info.stack_cnt > STACK_MAX_FRAMES) info.stack_cnt = STACK_MAX_FRAMES;
+
+    /* 方案 B：捕获叶子返回地址 [RSP]。内核 walker 用 RBP 链回溯，在 malloc 入口
+     * 会跳过 [RSP] 里的 return-to-caller（main 等），导致叶子调用者丢失。
+     * 读 [RSP] 插入到 stack_addrs[1]（frame 0 = malloc RIP 保留），walker 帧后移一位。
+     * 含去重：若 walker 已含 ra（某些内核不跳过叶子），不插，避免重复帧。 */
+    u64 ra = 0;
+    if (bpf_probe_read_user(&ra, sizeof(ra), (void *)PT_REGS_SP(ctx)) == 0 && ra != 0) {
+        int scnt = info.stack_cnt;
+        if (scnt > STACK_MAX_FRAMES) scnt = STACK_MAX_FRAMES;
+        int dup = 0;
+        int i;
+        for (i = 0; i < scnt; i++) {
+            if (info.stack_addrs[i] == ra) { dup = 1; break; }
+        }
+        if (!dup) {
+            if (scnt == 0) {
+                info.stack_addrs[0] = ra;
+                info.stack_cnt = 1;
+            } else {
+                int new_cnt = scnt + 1;
+                if (new_cnt > STACK_MAX_FRAMES) new_cnt = STACK_MAX_FRAMES;
+                for (i = STACK_MAX_FRAMES - 1; i >= 2; i--) {
+                    if (i < new_cnt) {
+                        info.stack_addrs[i] = info.stack_addrs[i - 1];
+                    }
+                }
+                info.stack_addrs[1] = ra;
+                info.stack_cnt = new_cnt;
+            }
+        }
+    }
+
     bpf_map_update_elem(&entry_info, &tid, &info, BPF_ANY);
     return 0;
 }
@@ -127,6 +159,12 @@ int trace_free_entry(struct pt_regs *ctx) {
 
     u64 old = __sync_fetch_and_sub(&info->refcount, 1);
     if (old > 0) {
+        /* 驱逐：refcount→0 删条目，防 allocs map 饱和导致稳态进程伪增长。
+         * 重读 refcount==0 守卫：并发 alloc（libc 复用同地址）已 +1 则不删，
+         * 把"删-增"竞态窗口压到 1 条 load 指令；残余概率极低且每次仅 +1（有界）。 */
+        if (old == 1 && info->refcount == 0) {
+            bpf_map_delete_elem(&allocs, &ptr);
+        }
         struct mem_event_t event = {};
         event.pid = bpf_get_current_pid_tgid() >> 32;
         event.tid = (u32)bpf_get_current_pid_tgid();

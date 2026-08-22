@@ -3,7 +3,7 @@
  * Hook: kprobe fd_install（所有 fd 创建的内核汇聚点）
  *       tracepoint sys_enter_close/dup2/dup3（close 侧）
  * 采样: 全量
- * 追踪方式: fd_map 引用计数（无 delete，原子操作，无 TOCTOU 竞态）
+ * 追踪方式: fd_map 引用计数（refcount→0 即驱逐，原子操作，无 TOCTOU 竞态）
  * 栈捕获: bpf_get_stack() 直接拷贝地址到事件
  *
  * 已知限制：
@@ -85,6 +85,11 @@ int trace_close(struct sys_enter_args *ctx) {
 
         u64 old = __sync_fetch_and_sub(&val->refcount, 1);
         if (old > 0) {
+            /* 驱逐：refcount→0 删条目，防 fd_map 饱和导致稳态进程伪增长。
+             * 重读 refcount==0 守卫：并发 fd_install 复用同 fd 已 +1 则不删。 */
+            if (old == 1 && val->refcount == 0) {
+                bpf_map_delete_elem(&fd_map, &key);
+            }
             struct fd_event_t event = {};
             event.pid = pid;
             event.fd = fd;
@@ -120,6 +125,9 @@ int trace_dup2(struct sys_enter_args *ctx) {
 
         u64 old = __sync_fetch_and_sub(&val->refcount, 1);
         if (old > 0) {
+            if (old == 1 && val->refcount == 0) {
+                bpf_map_delete_elem(&fd_map, &key);
+            }
             struct fd_event_t event = {};
             event.pid = pid;
             event.fd = newfd;
@@ -155,6 +163,9 @@ int trace_dup3(struct sys_enter_args *ctx) {
 
         u64 old = __sync_fetch_and_sub(&val->refcount, 1);
         if (old > 0) {
+            if (old == 1 && val->refcount == 0) {
+                bpf_map_delete_elem(&fd_map, &key);
+            }
             struct fd_event_t event = {};
             event.pid = pid;
             event.fd = newfd;

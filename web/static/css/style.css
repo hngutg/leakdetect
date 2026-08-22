@@ -60,9 +60,14 @@ body {
     min-height: 200px;
 }
 
-.resource-card.leak_suspected {
+.resource-card.leak_confirmed {
     border-color: #f44336;
     box-shadow: 0 0 8px rgba(244, 67, 54, 0.3);
+}
+
+.resource-card.leak_suspected {
+    border-color: #ff9800;
+    box-shadow: 0 0 8px rgba(255, 152, 0, 0.25);
 }
 
 .card-header {
@@ -84,7 +89,8 @@ body {
 }
 
 .status-badge.normal { background: #2e4d2e; color: #4caf50; }
-.status-badge.leak_suspected { background: #4d2e2e; color: #f44336; }
+.status-badge.leak_confirmed { background: #4d2e2e; color: #f44336; }
+.status-badge.leak_suspected { background: #4d402e; color: #ff9800; }
 .status-badge.observing { background: #4d4d2e; color: #ff9800; }
 
 .card-current {
@@ -143,6 +149,21 @@ body {
     border-bottom: 1px solid #0f3460;
 }
 
+.process-table .proc-pid {
+    color: #4fc3f7;
+    font-size: 11px;
+    margin-right: 6px;
+}
+
+.process-table .proc-name {
+    display: inline-block;
+    max-width: 160px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
+}
+
 .process-table tr:last-child td {
     border-bottom: none;
 }
@@ -152,23 +173,20 @@ body {
     color: #4fc3f7;
 }
 
-/* ========== 告警区 ========== */
+/* ========== 告警区（全宽，置顶） ========== */
 .alert-section {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 16px;
-    padding: 0 24px 24px;
+    padding: 16px 24px;
 }
 
-.alert-list, .stack-view {
+.alert-list {
     background: #16213e;
     border: 1px solid #0f3460;
     border-radius: 8px;
     padding: 16px;
-    min-height: 200px;
+    min-height: 120px;
 }
 
-.alert-list h3, .stack-view h3 {
+.alert-list h3 {
     color: #4fc3f7;
     margin-bottom: 12px;
     font-size: 15px;
@@ -201,6 +219,12 @@ body {
 
 .alert-item .alert-name {
     color: #81c784;
+    display: inline-block;
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
 }
 
 .alert-item .alert-detail {
@@ -219,6 +243,30 @@ body {
     color: #555;
     text-align: center;
     padding: 40px 0;
+}
+
+/* ========== 内联栈展示（在告警项下方展开） ========== */
+.alert-item .stack-view {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid #0f3460;
+    background: transparent;
+    border-left: none;
+    border-right: none;
+    border-bottom: none;
+    border-radius: 0;
+    min-height: auto;
+    padding-left: 0;
+    padding-right: 0;
+    padding-bottom: 0;
+}
+
+.alert-item .stack-view h3 {
+    display: none;
+}
+
+.alert-item .stack-view .placeholder {
+    display: none;
 }
 
 /* ========== F3: 告警标签切换 ========== */
@@ -247,6 +295,13 @@ body {
     color: #4fc3f7;
 }
 
+/* 确认泄露 tab（第 2 个按钮）active 时红色 accent 凸显 */
+.alert-tabs button:nth-child(2).active {
+    background: #4d2e2e;
+    color: #f44336;
+    border-color: #f44336;
+}
+
 .alert-item.selected {
     border-left-color: #4fc3f7;
     background: #1a2e4a;
@@ -260,6 +315,33 @@ body {
 .alert-item:hover {
     background: #1a2e4a;
 }
+
+/* 告警 severity 左边框（疑似=橙、确认=红、已消除=灰）*/
+.alert-item.suspected {
+    border-left: 3px solid #ff9800;
+}
+
+.alert-item.confirmed {
+    border-left: 3px solid #f44336;
+}
+
+.alert-item.resolved {
+    border-left: 3px solid #555;
+}
+
+/* stack-view header severity 徽章 */
+.sev-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 12px;
+    margin-right: 6px;
+    font-weight: bold;
+}
+
+.sev-suspected { background: #4d402e; color: #ff9800; }
+.sev-confirmed { background: #4d2e2e; color: #f44336; }
+.sev-resolved { background: #333; color: #888; }
 
 .loading {
     color: #888;
@@ -466,6 +548,143 @@ body {
     border-color: #4fc3f7 !important;
 }
 
+/* ========== 配置页面 ========== */
+.config-page {
+    padding: 24px;
+    max-width: 800px;
+    margin: 0 auto;
+}
+
+.config-header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 24px;
+}
+
+.config-header h2 {
+    color: #4fc3f7;
+    font-size: 18px;
+}
+
+.btn-back {
+    padding: 6px 16px;
+    background: #0f3460;
+    border: 1px solid #4fc3f7;
+    color: #4fc3f7;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 13px;
+}
+
+.btn-back:hover {
+    background: #1a4a7a;
+}
+
+.config-body {
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 8px;
+    padding: 24px;
+}
+
+.config-import-export {
+    display: flex;
+    gap: 8px;
+    margin-top: 16px;
+    margin-bottom: 16px;
+}
+
+.btn-import, .btn-export {
+    padding: 6px 16px;
+    background: transparent;
+    border: 1px solid #0f3460;
+    color: #ccc;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 12px;
+}
+
+.btn-import:hover, .btn-export:hover {
+    border-color: #4fc3f7;
+    color: #4fc3f7;
+}
+
+/* ========== 监控参数表格 ========== */
+.config-section {
+    margin-bottom: 24px;
+}
+
+.config-section-title {
+    color: #4fc3f7;
+    font-size: 15px;
+    margin-bottom: 8px;
+}
+
+.config-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.config-table th {
+    text-align: left;
+    color: #4fc3f7;
+    font-size: 12px;
+    padding: 8px 12px;
+    border-bottom: 1px solid #0f3460;
+}
+
+.config-table td {
+    padding: 8px 12px;
+    border-bottom: 1px solid #0f3460;
+    vertical-align: top;
+}
+
+.col-name {
+    width: 140px;
+    font-weight: bold;
+    color: #ccc;
+    font-size: 13px;
+}
+
+.col-value {
+    width: 130px;
+    white-space: nowrap;
+}
+
+.col-desc {
+    color: #888;
+    font-size: 12px;
+    line-height: 1.6;
+}
+
+.param-input {
+    width: 80px;
+    padding: 4px 8px;
+    background: #0f3460;
+    border: 1px solid #333;
+    border-radius: 3px;
+    color: #fff;
+    font-size: 13px;
+    text-align: right;
+}
+
+.param-input:focus {
+    border-color: #4fc3f7;
+    outline: none;
+}
+
+.param-unit {
+    color: #888;
+    font-size: 12px;
+    margin-left: 4px;
+}
+
+.param-readonly {
+    color: #888;
+    font-size: 13px;
+}
+
 /* ========== F4: 过滤控件 ========== */
 .filter-controls {
     display: flex;
@@ -557,10 +776,6 @@ body {
     }
 
     .resource-grid {
-        grid-template-columns: 1fr;
-    }
-
-    .alert-section {
         grid-template-columns: 1fr;
     }
 }

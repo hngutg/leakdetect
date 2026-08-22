@@ -44,7 +44,7 @@ def register_handlers(socketio):
         cid = data.get("container_id") if data else None
         print("[ws] select_container: %s" % cid)
         if backend is not None:
-            pass  # B3: backend.loader.update_cgroup_filter(cid)
+            backend.set_display_target(cid)
         else:
             from mock import producer
             producer.set_selected_container(cid)

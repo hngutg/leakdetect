@@ -68,5 +68,19 @@ const LeakDetectAPI = {
             encodeURIComponent(nameRegex) + "&pid_list=" + pidList
         );
         return resp.json();
+    },
+
+    async getMonitoringConfig() {
+        const resp = await fetch("/api/config/monitoring");
+        return resp.json();
+    },
+
+    async saveMonitoringConfig(config) {
+        const resp = await fetch("/api/config/monitoring", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(config)
+        });
+        return resp.json();
     }
 };

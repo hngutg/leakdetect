@@ -41,7 +41,7 @@ def alerts():
 @api.route("/api/containers")
 def containers():
     if _backend is not None:
-        return jsonify({"containers": []})  # B3: 接 cgroup 枚举
+        return jsonify({"containers": _backend.cgroup_enum.enumerate()})
     from mock import producer
     return jsonify({"containers": producer.containers})
 
@@ -72,3 +72,21 @@ def preview_filter():
         return jsonify({"matched": [], "unmatched": []})
     from mock import producer
     return jsonify(producer.preview_filter(name_regex, pid_list))
+
+
+@api.route("/api/config/monitoring", methods=["GET"])
+def get_monitoring_config():
+    if _backend is not None:
+        return jsonify(_backend.get_monitoring_config())
+    from mock import producer
+    return jsonify(producer.get_monitoring_config())
+
+
+@api.route("/api/config/monitoring", methods=["POST"])
+def set_monitoring_config():
+    data = request.get_json(silent=True) or {}
+    if _backend is not None:
+        _backend.update_monitoring_config(data)
+        return jsonify({"status": "applied"})
+    from mock import producer
+    return jsonify(producer.save_monitoring_config(data))

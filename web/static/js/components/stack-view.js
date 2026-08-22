@@ -12,6 +12,7 @@ const StackView = {
       <div v-if="!alert" class="placeholder">点击左侧告警查看栈</div>
       <div v-else>
         <div class="stack-header">
+          <span class="sev-badge" :class="'sev-' + alert.severity">{{ severityLabel(alert.severity) }}</span>
           {{ resourceLabel(alert.resource) }}泄露 - PID {{ alert.pid }} ({{ alert.process_name }})
         </div>
         <div class="stack-tree">
@@ -33,6 +34,9 @@ const StackView = {
   methods: {
     resourceLabel(r) {
       return { mem: '内存', thread: '线程', fd: '句柄', cpu: 'CPU' }[r] || r;
+    },
+    severityLabel(s) {
+      return { suspected: '疑似', confirmed: '确认泄露', resolved: '已消除' }[s] || (s || '');
     },
     formatTime(ts) {
       if (!ts) return '-';

@@ -183,7 +183,7 @@ class MockProducer:
                 "resource": "mem",
                 "pid": 1234,
                 "process_name": "nginx",
-                "severity": "leak",
+                "severity": "confirmed",
                 "detail": "outstanding +%dMB in %ds" % (delta_mb, int(elapsed)),
                 "timestamp": now,
                 "stack": [
@@ -200,7 +200,7 @@ class MockProducer:
                 "resource": "fd",
                 "pid": 9012,
                 "process_name": "app",
-                "severity": "leak",
+                "severity": "suspected",
                 "detail": "+%d FD in %ds" % (delta_fd, int(elapsed)),
                 "timestamp": now,
                 "stack": [
@@ -265,7 +265,7 @@ class MockProducer:
                 "resource": resource,
                 "pid": pid,
                 "process_name": pname,
-                "severity": "leak",
+                "severity": "confirmed",
                 "detail": "outstanding +%d%s in 60s" % (
                     random.randint(1, 10),
                     "MB" if resource == "mem" else " FD" if resource == "fd" else " threads",
@@ -322,6 +322,30 @@ class MockProducer:
             else:
                 unmatched.append(p)
         return {"matched": matched, "unmatched": unmatched}
+
+    def get_monitoring_config(self):
+        return {
+            "mem": {
+                "outstanding_delta_bytes": 10240, "observe_seconds": 30,
+                "leak_seconds": 60, "clear_ratio": 0.5, "clear_seconds": 30,
+                "resolve_seconds": 60, "stabilize_seconds": 300, "grace_seconds": 120, "confirm_seconds": 240,
+            },
+            "thread": {
+                "delta_threshold": 0.1, "observe_seconds": 30,
+                "leak_seconds": 120, "clear_ratio": 0.5, "clear_seconds": 30,
+                "resolve_seconds": 60, "stabilize_seconds": 300, "grace_seconds": 120, "confirm_seconds": 240,
+            },
+            "fd": {
+                "delta_threshold": 0.5, "observe_seconds": 30,
+                "leak_seconds": 120, "clear_ratio": 0.5, "clear_seconds": 30,
+                "resolve_seconds": 60, "stabilize_seconds": 300, "grace_seconds": 120, "confirm_seconds": 240,
+            },
+            "cpu": {"cpu_interval": 1},
+            "sampling_rate": 100,
+        }
+
+    def save_monitoring_config(self, data):
+        return {"status": "applied"}
 
 
 producer = MockProducer()

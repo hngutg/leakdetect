@@ -32,3 +32,4 @@ build/
 
 # 前端 vendor 下载临时文件
 web/static/vendor/*.tmp
+tools/package_arm.sh

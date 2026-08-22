@@ -29,7 +29,11 @@ if [ ! -d "$INCLUDE_PATH/asm" ]; then
     echo "  Or:  yum install kernel-headers (RHEL/EulerOS)"
 fi
 
-CFLAGS="-target bpf -D__TARGET_ARCH_${BPF_ARCH} -g -O2 -I${INCLUDE_PATH} -I${BPF_DIR}"
+# __x86_64__ 让 bpf_tracing.h 选 64 位 PT_REGS 字段（clang -target bpf 不自动定义它，
+# 否则落 32 位分支 eax/esp → 在 x86_64 pt_regs 上偏移错 → verifier 拒）。仅 x86_64 需要。
+ARCH_FLAGS=""
+[ "$BPF_ARCH" = "x86" ] && ARCH_FLAGS="-D__x86_64__"
+CFLAGS="-target bpf -D__TARGET_ARCH_${BPF_ARCH} ${ARCH_FLAGS} -g -O2 -I${INCLUDE_PATH} -I${BPF_DIR}"
 
 echo "Building BPF programs (arch=$ARCH, target=$BPF_ARCH)..."
 clang $CFLAGS -c "$BPF_DIR/mem.bpf.c" -o "$OUT_DIR/mem.o"
