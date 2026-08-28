@@ -70,3 +70,34 @@ class Database:
             )
             series = [{"t": row[0], "v": row[1]} for row in cur.fetchall()]
         return {"range": range_tag, "series": series}
+
+    def query_alerts(self, range_tag):
+        """查询历史告警（REST /api/alerts 调用）。"""
+        import json
+        ranges = {"24h": 86400, "1d": 86400, "7d": 604800, "30d": 2592000}
+        duration = ranges.get(range_tag, 86400)
+        cutoff = int(time.time()) - duration
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT id, timestamp, resource, pid, process_name, "
+                "severity, detail, stack_json FROM alerts "
+                "WHERE timestamp >= ? ORDER BY timestamp DESC",
+                (cutoff,)
+            )
+            alerts = []
+            for row in cur.fetchall():
+                try:
+                    stack = json.loads(row[7]) if row[7] else []
+                except (ValueError, TypeError):
+                    stack = []
+                alerts.append({
+                    "id": row[0],
+                    "timestamp": row[1],
+                    "resource": row[2],
+                    "pid": row[3],
+                    "process_name": row[4],
+                    "severity": row[5],
+                    "detail": row[6],
+                    "stack": stack,
+                })
+        return alerts

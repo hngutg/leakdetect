@@ -45,6 +45,7 @@ struct alloc_info_t {
     u64 size;
     int stack_cnt;
     u64 stack_addrs[STACK_MAX_FRAMES];
+    u32 pid;                    /* 死 pid 清理用 */
 };
 
 /* 线程事件结构 */
@@ -79,6 +80,34 @@ struct fd_value_t {
     u64 refcount;
     int stack_cnt;
     u64 stack_addrs[STACK_MAX_FRAMES];
+};
+
+/* outstanding_map 的 key：per-(pid,stack) 内存聚合 */
+struct outstanding_key_t {
+    u64 pid;
+    u64 stack_addrs[STACK_MAX_FRAMES];
+};
+
+/* outstanding_map 的 value：双计数器（add only，无 sub → 无 u64 回绕窗口）+ comm + stack_cnt */
+struct outstanding_val_t {
+    u64 alloc_bytes;
+    u64 free_bytes;
+    char comm[16];
+    int stack_cnt;
+};
+
+/* fd_count_map 的 key：per-pid fd 计数 */
+struct fd_count_key_t {
+    u64 pid;
+};
+
+/* fd_count_map 的 value：双计数器（add only，无 sub → 无 u64 回绕窗口）+ comm + 栈（last open）*/
+struct fd_count_val_t {
+    u64 open_count;
+    u64 close_count;
+    u64 stack_addrs[STACK_MAX_FRAMES];
+    char comm[16];
+    int stack_cnt;
 };
 
 #endif /* __COMMON_H */

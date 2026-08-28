@@ -6,6 +6,12 @@ const StackView = {
   props: {
     alert: { type: Object, default: null },
   },
+  computed: {
+    reversedStack() {
+      if (!this.alert || !this.alert.stack) return [];
+      return [...this.alert.stack].reverse();
+    }
+  },
   template: `
     <div class="stack-view">
       <h3>泄露栈展示</h3>
@@ -16,13 +22,13 @@ const StackView = {
           {{ resourceLabel(alert.resource) }}泄露 - PID {{ alert.pid }} ({{ alert.process_name }})
         </div>
         <div class="stack-tree">
-          <div v-for="(frame, i) in alert.stack" :key="i"
+          <div v-for="(frame, i) in reversedStack" :key="i"
                class="stack-frame"
-               :class="{ suspect: i === alert.stack.length - 1 }"
+               :class="{ suspect: i === reversedStack.length - 1 }"
                :style="{ marginLeft: (i * 20) + 'px' }">
             <span class="frame-func">{{ frame.func }}</span>
             <span class="frame-addr">{{ frame.addr }}</span>
-            <span v-if="i === alert.stack.length - 1" class="suspect-tag">← 嫌疑点</span>
+            <span v-if="i === reversedStack.length - 1" class="suspect-tag">← 嫌疑点</span>
           </div>
         </div>
         <div class="stack-footer">

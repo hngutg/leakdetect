@@ -33,7 +33,7 @@ def history():
 def alerts():
     range_tag = request.args.get("range", "24h")
     if _backend is not None:
-        return jsonify({"alerts": []})  # B2/B4: 接 SQLite alerts 表
+        return jsonify({"alerts": _backend.get_alerts(range_tag)})
     from mock import producer
     return jsonify({"alerts": producer.get_alerts(range_tag)})
 

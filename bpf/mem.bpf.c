@@ -1,19 +1,16 @@
-/* mem.bpf.c - 内存泄露检测 BPF 程序（libbpf 风格）
+/* mem.bpf.c - 内存泄露检测 BPF 程序（libbpf 风格，map 聚合版）
  *
+ * B 方案：删 events ring，改用 outstanding_map（per-(pid,stack) 聚合，Python 定期读）。
  * Hook: uprobe malloc entry/return + uprobe free entry
  * 采样: 1/100（sampler map 计数）
- * 配对追踪: allocs[ptr] = {refcount, size, stack_cnt, stack_addrs}（refcount 原子操作）
- * 栈捕获: bpf_get_stack() 直接拷贝地址到事件
+ * 配对追踪: allocs[ptr] = {refcount, size, stack}（refcount 原子操作，驱逐）
+ * 聚合: outstanding_map[{pid, stack}] = {alloc_bytes, free_bytes, comm, stack_cnt}（atomic add only，无 sub → 无 u64 回绕窗口）
+ * 栈捕获: bpf_get_stack() 直接拷贝地址到 entry_info/outstanding_map key
  */
 
 #include "common.h"
 
-/* BPF Maps（libbpf SEC 风格，替代 BCC 宏） */
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1024 * 1024);
-} events SEC(".maps");
-
+/* BPF Maps（libbpf SEC 风格） */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, u32);
@@ -32,8 +29,15 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, u64);
     __type(value, struct alloc_info_t);
-    __uint(max_entries, 100000);
+    __uint(max_entries, 1000000);
 } allocs SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct outstanding_key_t);
+    __type(value, struct outstanding_val_t);
+    __uint(max_entries, 1000000);
+} outstanding_map SEC(".maps");
 
 /* malloc entry: 采样 + 记录 size + 捕获栈 */
 SEC("uprobe")
@@ -55,10 +59,6 @@ int trace_malloc_entry(struct pt_regs *ctx) {
     info.stack_cnt = (ret >= 0) ? ret / (int)sizeof(u64) : 0;
     if (info.stack_cnt > STACK_MAX_FRAMES) info.stack_cnt = STACK_MAX_FRAMES;
 
-    /* 方案 B：捕获叶子返回地址 [RSP]。内核 walker 用 RBP 链回溯，在 malloc 入口
-     * 会跳过 [RSP] 里的 return-to-caller（main 等），导致叶子调用者丢失。
-     * 读 [RSP] 插入到 stack_addrs[1]（frame 0 = malloc RIP 保留），walker 帧后移一位。
-     * 含去重：若 walker 已含 ra（某些内核不跳过叶子），不插，避免重复帧。 */
     u64 ra = 0;
     if (bpf_probe_read_user(&ra, sizeof(ra), (void *)PT_REGS_SP(ctx)) == 0 && ra != 0) {
         int scnt = info.stack_cnt;
@@ -90,7 +90,7 @@ int trace_malloc_entry(struct pt_regs *ctx) {
     return 0;
 }
 
-/* malloc return: 取 ptr + 存 allocs map + 发 alloc 事件 */
+/* malloc return: 取 ptr + 存 allocs map + 更新 outstanding_map */
 SEC("uretprobe")
 int trace_malloc_return(struct pt_regs *ctx) {
     u64 ptr = PT_REGS_RC(ctx);
@@ -104,7 +104,8 @@ int trace_malloc_return(struct pt_regs *ctx) {
         return 0;
     }
 
-    /* 存入 allocs 追踪 map（refcount 方式） */
+    u64 pid = bpf_get_current_pid_tgid() >> 32;
+
     struct alloc_info_t *alloc = bpf_map_lookup_elem(&allocs, &ptr);
     if (!alloc) {
         struct alloc_info_t zero = {};
@@ -115,32 +116,36 @@ int trace_malloc_return(struct pt_regs *ctx) {
         __sync_fetch_and_add(&alloc->refcount, 1);
         alloc->size = info->size;
         alloc->stack_cnt = info->stack_cnt;
+        alloc->pid = (u32)pid;
         int i;
         for (i = 0; i < STACK_MAX_FRAMES; i++) {
             alloc->stack_addrs[i] = info->stack_addrs[i];
         }
     }
 
-    /* 发 alloc 事件 */
-    struct mem_event_t event = {};
-    event.pid = bpf_get_current_pid_tgid() >> 32;
-    event.tid = tid;
-    event.size = info->size;
-    event.ptr = ptr;
-    event.stack_cnt = info->stack_cnt;
+    struct outstanding_key_t okey = {};
+    okey.pid = pid;
     int j;
     for (j = 0; j < STACK_MAX_FRAMES; j++) {
-        event.stack_addrs[j] = info->stack_addrs[j];
+        okey.stack_addrs[j] = info->stack_addrs[j];
     }
-    event.op = 'a';
-    bpf_get_current_comm(&event.comm, sizeof(event.comm));
-    bpf_ringbuf_output(&events, &event, sizeof(event), 0);
+    struct outstanding_val_t *oval = bpf_map_lookup_elem(&outstanding_map, &okey);
+    if (!oval) {
+        struct outstanding_val_t zero = {};
+        bpf_map_update_elem(&outstanding_map, &okey, &zero, BPF_ANY);
+        oval = bpf_map_lookup_elem(&outstanding_map, &okey);
+    }
+    if (oval) {
+        __sync_fetch_and_add(&oval->alloc_bytes, info->size);
+        bpf_get_current_comm(oval->comm, sizeof(oval->comm));
+        oval->stack_cnt = info->stack_cnt;
+    }
 
     bpf_map_delete_elem(&entry_info, &tid);
     return 0;
 }
 
-/* free entry: 原子递减 refcount + 局部变量拷贝 */
+/* free entry: outstanding_map free_bytes add + allocs refcount sub + 驱逐 */
 SEC("uprobe")
 int trace_free_entry(struct pt_regs *ctx) {
     u64 ptr = PT_REGS_PARM1(ctx);
@@ -150,34 +155,24 @@ int trace_free_entry(struct pt_regs *ctx) {
     }
 
     u64 size = info->size;
-    int stack_cnt = info->stack_cnt;
-    u64 stack_addrs[STACK_MAX_FRAMES];
-    int i;
-    for (i = 0; i < STACK_MAX_FRAMES; i++) {
-        stack_addrs[i] = info->stack_addrs[i];
+
+    u64 pid = (u64)(bpf_get_current_pid_tgid() >> 32);
+    struct outstanding_key_t okey = {};
+    okey.pid = pid;
+    int j;
+    for (j = 0; j < STACK_MAX_FRAMES; j++) {
+        okey.stack_addrs[j] = info->stack_addrs[j];
+    }
+    struct outstanding_val_t *oval = bpf_map_lookup_elem(&outstanding_map, &okey);
+    if (oval) {
+        __sync_fetch_and_add(&oval->free_bytes, size);
     }
 
     u64 old = __sync_fetch_and_sub(&info->refcount, 1);
     if (old > 0) {
-        /* 驱逐：refcount→0 删条目，防 allocs map 饱和导致稳态进程伪增长。
-         * 重读 refcount==0 守卫：并发 alloc（libc 复用同地址）已 +1 则不删，
-         * 把"删-增"竞态窗口压到 1 条 load 指令；残余概率极低且每次仅 +1（有界）。 */
         if (old == 1 && info->refcount == 0) {
             bpf_map_delete_elem(&allocs, &ptr);
         }
-        struct mem_event_t event = {};
-        event.pid = bpf_get_current_pid_tgid() >> 32;
-        event.tid = (u32)bpf_get_current_pid_tgid();
-        event.size = size;
-        event.ptr = ptr;
-        event.stack_cnt = stack_cnt;
-        int j;
-        for (j = 0; j < STACK_MAX_FRAMES; j++) {
-            event.stack_addrs[j] = stack_addrs[j];
-        }
-        event.op = 'f';
-        bpf_get_current_comm(&event.comm, sizeof(event.comm));
-        bpf_ringbuf_output(&events, &event, sizeof(event), 0);
     } else {
         __sync_fetch_and_add(&info->refcount, 1);
     }

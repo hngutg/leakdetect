@@ -551,3 +551,116 @@ sqlite3 data/leakdetect.db "SELECT * FROM alerts ORDER BY timestamp DESC LIMIT 5
 # 如果没有 sqlite3 CLI：
 python3 -c "import sqlite3; db=sqlite3.connect('data/leakdetect.db'); print(db.execute('SELECT COUNT(*) FROM samples').fetchone())"
 ```
+
+---
+
+## 十、栈解析与离线定位
+
+### 10.1 栈显示分层说明
+
+告警触发后，点击告警展开栈。栈按调用链从上到下展示（调用者在上方，被调用者在下方），最内层帧标"← 嫌疑点"（分配/创建发生处）。
+
+栈帧的显示内容取决于目标环境是否有调试符号（debuginfo）：
+
+**有 debuginfo（如 x86 VM 装了 libc6-dbg）**：
+
+```
+_start+0x25 (mem_leak.c:86)                              ← 函数名+源码行号
+__libc_start_main_alias_2+0x8b (libc_start_call_main.h:128)
+main+0x3a (mem_leak.c:22)
+__GI___libc_malloc (arena.c:3294) ← 嫌疑点
+```
+
+每帧都有：函数名 + 偏移 + 源码文件:行号。开发者直接看到泄露发生在哪个源码的哪一行。
+
+**无 debuginfo（如 ARM EulerOS 无网络）**：
+
+```
+_start+0x30                                              ← 用户程序符号(.symtab 自带)
+__libc_start_main+0x98                                   ← 导出函数(.dynsym 自带)
+libc.so.6+0x27784                                       ← 兜底(库名+偏移，无函数名)
+main+0x4c                                                ← 用户程序符号
+malloc ← 嫌疑点                                          ← 导出函数
+```
+
+导出函数（malloc, main, __libc_start_main）有名字；内部函数显示 `库名+偏移`（知道在哪个库的什么位置，但不知道函数名）。
+
+**完全无信息**：`[unknown]`（地址不在任何文件映射里，极罕见，通常是帧指针断裂导致的垃圾地址）。
+
+### 10.2 为什么有些帧没有函数名
+
+系统库（如 libc）在发布时被 strip（移除了 `.symtab` 函数符号表），只保留 `.dynsym`（导出函数符号表）。导出函数（malloc, free, __libc_start_main 等）在 `.dynsym` 里，能解析。内部函数（`__libc_start_call_main`, `_int_malloc` 等）不在 `.dynsym` 里，无法解析。
+
+补回内部函数名需要 debuginfo 包（含完整 `.symtab`）。debuginfo 与二进制版本严格绑定（build-id 匹配），不能跨版本/跨发行版使用。
+
+### 10.3 有网络环境：安装 debuginfo
+
+如果目标环境有网络，安装 debuginfo 后工具自动读取，无需额外配置：
+
+```bash
+# Ubuntu/Debian
+sudo apt install libc6-dbg          # libc 内部函数名+行号
+sudo apt install python3-dbg        # Python C 层函数名+行号
+
+# RHEL/EulerOS（需要 debuginfo 仓库）
+sudo yum install yum-utils
+sudo debuginfo-install glibc        # libc 内部函数名+行号
+```
+
+安装后重启 leakdetect（清符号缓存），工具自动读取 debuginfo：
+- 有 debuginfo 的帧：`__GI___libc_malloc (arena.c:3294)` ← 函数名+行号
+- 无 debuginfo 的帧：`libc.so.6+0x偏移` ← 兜底
+
+debuginfo 与二进制版本绑定（build-id 匹配），必须装对应版本的包。
+
+### 10.4 无网络环境：离线解析（addr2line）
+
+在无 debuginfo 的目标环境上，开发者可以把二进制文件拷到有 debuginfo 的机器上，用 `addr2line` 离线解析地址：
+
+```bash
+# 1. 从目标节点拷出 libc（或其他需要解析的二进制）
+scp root@<目标节点>:/usr/lib64/libc.so.6 ~/libc-arm.so.6
+
+# 2. 在有 debuginfo 的机器上（如 x86 开发机，装了对应版本的 debuginfo）
+# 解析单个地址
+addr2line -e libc-arm.so.6 -f 0x27784
+# 输出示例：
+# __libc_start_call_main
+# /path/to/libc-start.c:74
+
+# 3. 批量解析栈中所有地址
+# 把栈里显示的偏移（如 libc.so.6+0x27784）提取出来，逐个 addr2line
+for offset in 0x27784 0x27868 0x8f810; do
+    echo -n "$offset: "
+    addr2line -e libc-arm.so.6 -f $offset
+done
+
+# 4. 如果没有 addr2line，用 objdump 看反汇编（不需要 debuginfo）
+objdump -d libc-arm.so.6 | grep -A5 "27784:"
+# 输出该地址附近的汇编指令
+```
+
+**注意**：
+- `addr2line` 需要对应版本的 debuginfo 才能解析出函数名和行号
+- 没有 debuginfo 时，`addr2line` 只能输出 `?? ??:0`（和工具显示 [unknown] 一样）
+- 不同发行版/版本的 debuginfo 不通用（build-id 必须匹配）
+- 目标节点的 libc 版本可通过 `ldd --version` 查看
+
+### 10.5 提升栈质量的建议
+
+| 建议 | 效果 | 适用场景 |
+|---|---|---|
+| 目标环境装 debuginfo（如 `apt install libc6-dbg`） | 内部函数名+源码行号 | 有网络的目标环境 |
+| 用户自有代码编译时加 `-g` | 用户程序的源码行号 | 用户可控制编译 |
+| 用户自有代码编译时加 `-fno-omit-frame-pointer` | 栈完整不丢帧（BPF 帧指针回溯不断裂） | 用户可控制编译 |
+| 工具打包自带 debuginfo（build-id 匹配时） | 内部函数名+行号，无需目标装包 | 无网络目标环境（需预先获取 .debug 文件，详见 0826 文档 P7） |
+
+### 10.6 栈帧格式速查
+
+| 显示格式 | 含义 | 信息量 |
+|---|---|---|
+| `func+0xoff (file:line)` | 函数名+偏移+源码文件行号 | ★★★ 最完整 |
+| `func+0xoff` | 函数名+偏移（无行号） | ★★ 有函数名 |
+| `func` | 函数名（偏移为0） | ★★ |
+| `library.so+0xoff` | 库名+偏移（无函数名） | ★ 兜底（知道在哪个库） |
+| `[unknown]` | 地址不在任何文件映射 | 无信息（极罕见） |

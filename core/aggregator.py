@@ -26,47 +26,27 @@ class Aggregator:
 
     # ========== 内存（B1） ==========
 
-    def on_mem_event(self, event):
-        pid = event["pid"]
-        op = event["op"]
-        cnt = event["stack_cnt"]
-        addrs = event["stack_addrs"]
-        sid = tuple(addrs) if cnt > 0 else ()
+    def set_mem_stats(self, stats):
+        """B 方案：整体替换 mem_stats（由 loader.read_outstanding_map 设置）。"""
         with self._lock:
-            if pid not in self.mem_stats:
-                self.mem_stats[pid] = {}
-            if sid not in self.mem_stats[pid]:
-                self.mem_stats[pid][sid] = {
-                    "alloc_bytes": 0, "alloc_count": 0,
-                    "free_bytes": 0, "free_count": 0,
-                    "comm": event["comm"],
-                    "stack_addrs": addrs,
-                    "stack_cnt": cnt,
-                }
-            stats = self.mem_stats[pid][sid]
-            if op == 'a':
-                stats["alloc_bytes"] += event["size"]
-                stats["alloc_count"] += 1
-            elif op == 'f':
-                stats["free_bytes"] += event["size"]
-                stats["free_count"] += 1
+            self.mem_stats = stats
 
     def get_total_outstanding(self):
         with self._lock:
-            total = sum(s["alloc_bytes"] - s["free_bytes"]
-                        for stacks in self.mem_stats.values()
-                        for s in stacks.values())
-        return max(0, total) * 100
+            total = sum(max(0, s["alloc_bytes"] - s["free_bytes"])
+                    for stacks in self.mem_stats.values()
+                    for s in stacks.values())
+        return total * 100
 
     def get_per_process_mem(self):
         result = []
         with self._lock:
             for pid, stacks in self.mem_stats.items():
-                total = sum(s["alloc_bytes"] - s["free_bytes"]
+                total = sum(max(0, s["alloc_bytes"] - s["free_bytes"])
                             for s in stacks.values())
                 comm = next(iter(stacks.values()))["comm"] if stacks else ""
                 result.append({"pid": pid, "name": comm,
-                               "value": max(0, total) * 100, "delta_60s": 0})
+                               "value": total * 100, "delta_60s": 0})
         return sorted(result, key=lambda x: x["value"], reverse=True)
 
     # ========== 线程（B2） ==========
@@ -91,8 +71,8 @@ class Aggregator:
 
     def get_total_thread_count(self):
         with self._lock:
-            return max(0, sum(s["created"] - s["exited"]
-                              for s in self.thread_stats.values()))
+            return sum(max(0, s["created"] - s["exited"])
+                      for s in self.thread_stats.values())
 
     def get_per_process_thread(self):
         result = []
@@ -104,27 +84,15 @@ class Aggregator:
 
     # ========== 句柄（B2，per-PID 计数，与线程相同模式） ==========
 
-    def on_fd_event(self, event):
-        pid = event["pid"]
+    def set_fd_stats(self, stats):
+        """B 方案：整体替换 fd_stats（由 loader.read_fd_count_map 设置）。"""
         with self._lock:
-            if pid not in self.fd_stats:
-                self.fd_stats[pid] = {
-                    "open_count": 0, "close_count": 0,
-                    "comm": event["comm"],
-                    "stack_addrs": [],
-                    "stack_cnt": 0,
-                }
-            if event["op"] == 'o':
-                self.fd_stats[pid]["open_count"] += 1
-                self.fd_stats[pid]["stack_addrs"] = event.get("stack_addrs", [])
-                self.fd_stats[pid]["stack_cnt"] = event.get("stack_cnt", 0)
-            elif event["op"] == 'c':
-                self.fd_stats[pid]["close_count"] += 1
+            self.fd_stats = stats
 
     def get_total_fd_count(self):
         with self._lock:
-            return max(0, sum(s["open_count"] - s["close_count"]
-                              for s in self.fd_stats.values()))
+            return sum(max(0, s["open_count"] - s["close_count"])
+                      for s in self.fd_stats.values())
 
     def get_per_process_fd(self):
         result = []

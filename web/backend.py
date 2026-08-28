@@ -66,14 +66,14 @@ class Backend:
         ingest = IngestManager(self.aggregator, self.symbolizer)
         self._ingest = ingest
         self.loader.start_event_loop({
-            "mem": ingest.on_mem_event,
             "threads": ingest.on_thread_event,
-            "fd": ingest.on_fd_event,
         })
 
+        threading.Thread(target=self._map_reader_loop, daemon=True).start()
         threading.Thread(target=self._analyzer_loop, daemon=True).start()
         threading.Thread(target=self._cpu_loop, daemon=True).start()
         threading.Thread(target=self._sampler_loop, daemon=True).start()
+        threading.Thread(target=self._dead_pid_cleaner_loop, daemon=True).start()
 
         self.cgroup_enum.start()
         self._started = True
@@ -82,6 +82,28 @@ class Backend:
     def set_display_target(self, cid):
         """设置显示过滤目标：None=宿主 / cid=容器（仅影响显示，不影响采集存储）。"""
         self.display_target = cid
+
+    def _map_reader_loop(self):
+        """B 方案：1s 读 BPF map → set aggregator.mem_stats/fd_stats。"""
+        while True:
+            try:
+                self.aggregator.set_mem_stats(self.loader.read_outstanding_map())
+                self.aggregator.set_fd_stats(self.loader.read_fd_count_map())
+            except Exception as e:
+                print("[backend] map_reader error: %s" % e)
+            time.sleep(1)
+
+    def _dead_pid_cleaner_loop(self):
+        """每 60s 清理 allocs/fd_map 中已退出进程的条目。"""
+        while True:
+            try:
+                n1 = self.loader.clean_dead_pid_allocs()
+                n2 = self.loader.clean_dead_pid_fd_map()
+                if n1 + n2 > 0:
+                    print("[backend] cleaned %d allocs + %d fd_map dead pid entries" % (n1, n2))
+            except Exception as e:
+                print("[backend] dead pid cleaner error: %s" % e)
+            time.sleep(60)
 
     def _analyzer_loop(self):
         while True:
@@ -98,10 +120,6 @@ class Backend:
                     a["process_name"] = self.cgroup_enum.pid_cmdline(a["pid"]) or a["process_name"]
                     self.logger.log(a)
                     self.db.write_alert(a)
-                if hasattr(self, '_ingest'):
-                    ing = self._ingest
-                    print("[debug] fd_stats: open=%d close_matched=%d close_unmatched=%d" % (
-                        ing._fd_open_total, ing._fd_close_matched, ing._fd_close_unmatched))
             except Exception as e:
                 print("[backend] analyzer error: %s" % e)
             time.sleep(5)
@@ -177,6 +195,9 @@ class Backend:
 
     def get_history(self, resource, range_tag):
         return self.db.query_history(resource, range_tag)
+
+    def get_alerts(self, range_tag):
+        return self.db.query_alerts(range_tag)
 
     def get_monitoring_config(self):
         """返回当前监控参数（从分析器实例属性读取）。"""

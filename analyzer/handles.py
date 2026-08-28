@@ -2,10 +2,8 @@
 
 对应里程碑：B2
 复用 TrendLeakDetector 基类的 OLS 斜率 + 显著性 + 状态生命周期。
-精度专项：阈值语义 delta→斜率（fd/sec，默认 0.5）；排自身 PID。
+精度专项：阈值语义 delta→斜率（fd/sec，默认 0.5）。
 """
-
-import os
 
 from analyzer.base import TrendLeakDetector
 
@@ -32,13 +30,10 @@ class HandleLeakDetector(TrendLeakDetector):
 
     def _iter_stats(self, aggregator):
         """迭代句柄聚合数据：yield (key, value, comm, stack_addrs, stack_cnt, pid)
-        per-PID 计数（与线程相同）；排自身 PID。锁内拷贝，锁外 yield。"""
-        my_pid = os.getpid()
+        per-PID 计数（与线程相同）；锁内拷贝，锁外 yield。"""
         with aggregator._lock:
             data = []
             for pid, stats in aggregator.fd_stats.items():
-                if pid == my_pid:
-                    continue
                 fd_count = max(0, stats["open_count"] - stats["close_count"])
                 key = pid
                 data.append((key, fd_count, stats["comm"],

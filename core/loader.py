@@ -70,10 +70,82 @@ libbpf.ring_buffer__new.argtypes = [ctypes.c_int, ctypes.c_void_p,
 libbpf.ring_buffer__poll.restype = ctypes.c_int
 libbpf.ring_buffer__poll.argtypes = [ctypes.c_void_p, ctypes.c_int]
 
+libbpf.bpf_map_get_next_key.restype = ctypes.c_int
+libbpf.bpf_map_get_next_key.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+
+libbpf.bpf_map_lookup_elem.restype = ctypes.c_int
+libbpf.bpf_map_lookup_elem.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+
+libbpf.bpf_map_delete_elem.restype = ctypes.c_int
+libbpf.bpf_map_delete_elem.argtypes = [ctypes.c_int, ctypes.c_void_p]
+
 # ring buffer 回调类型: int (*)(void *ctx, void *data, size_t size)
 # 返回 0 = 继续处理，非 0 = 停止
 RING_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
                            ctypes.c_void_p, ctypes.c_size_t)
+
+STACK_MAX = 8
+
+
+class OutstandingKey(ctypes.Structure):
+    _fields_ = [
+        ("pid", ctypes.c_ulonglong),
+        ("stack_addrs", ctypes.c_ulonglong * STACK_MAX),
+    ]
+
+
+class OutstandingVal(ctypes.Structure):
+    _fields_ = [
+        ("alloc_bytes", ctypes.c_ulonglong),
+        ("free_bytes", ctypes.c_ulonglong),
+        ("comm", ctypes.c_char * 16),
+        ("stack_cnt", ctypes.c_int),
+    ]
+
+
+class FdCountKey(ctypes.Structure):
+    _fields_ = [
+        ("pid", ctypes.c_ulonglong),
+    ]
+
+
+class FdCountVal(ctypes.Structure):
+    _fields_ = [
+        ("open_count", ctypes.c_ulonglong),
+        ("close_count", ctypes.c_ulonglong),
+        ("stack_addrs", ctypes.c_ulonglong * STACK_MAX),
+        ("comm", ctypes.c_char * 16),
+        ("stack_cnt", ctypes.c_int),
+    ]
+
+
+class AllocsKey(ctypes.Structure):
+    _fields_ = [("ptr", ctypes.c_ulonglong)]
+
+
+class AllocsVal(ctypes.Structure):
+    _fields_ = [
+        ("refcount", ctypes.c_ulonglong),
+        ("size", ctypes.c_ulonglong),
+        ("stack_cnt", ctypes.c_int),
+        ("stack_addrs", ctypes.c_ulonglong * STACK_MAX),
+        ("pid", ctypes.c_uint32),
+    ]
+
+
+class FdKey(ctypes.Structure):
+    _fields_ = [
+        ("pid", ctypes.c_uint32),
+        ("fd", ctypes.c_int32),
+    ]
+
+
+class FdVal(ctypes.Structure):
+    _fields_ = [
+        ("refcount", ctypes.c_ulonglong),
+        ("stack_cnt", ctypes.c_int),
+        ("stack_addrs", ctypes.c_ulonglong * STACK_MAX),
+    ]
 
 
 # ========== ELF 符号查找 ==========
@@ -231,10 +303,10 @@ class BpfLoader:
         print("[loader] fd kprobe + tracepoints attached")
 
     def start_event_loop(self, callbacks):
-        """启动 ring buffer 轮询（单线程轮询所有 BPF 对象）。
+        """启动 ring buffer 轮询（B 方案：仅 threads ring，mem/fd 用 map 聚合）。
 
         Args:
-            callbacks: {"mem": on_mem_event, "threads": on_thread_event, "fd": on_fd_event}
+            callbacks: {"threads": on_thread_event}
         """
         for resource, cb in callbacks.items():
             self._open_ring_buffer(resource, cb)
@@ -254,6 +326,151 @@ class BpfLoader:
             if count % 1000 == 0:
                 print("[loader] _poll_all cycle %d" % count)
             time.sleep(0.001)
+
+    def _get_map_fd(self, resource, map_name):
+        obj = self._objects.get(resource)
+        if not obj:
+            return -1
+        if isinstance(map_name, str):
+            map_name = map_name.encode("utf-8")
+        map_obj = libbpf.bpf_object__find_map_by_name(obj, map_name)
+        if not map_obj:
+            return -1
+        return libbpf.bpf_map__fd(map_obj)
+
+    def iter_map(self, resource, map_name, key_cls, val_cls):
+        fd = self._get_map_fd(resource, map_name)
+        if fd < 0:
+            return
+        key = key_cls()
+        next_key = key_cls()
+        val = val_cls()
+        ret = libbpf.bpf_map_get_next_key(fd, None, ctypes.byref(next_key))
+        while ret == 0:
+            ctypes.memmove(ctypes.byref(key), ctypes.byref(next_key), ctypes.sizeof(key_cls))
+            r = libbpf.bpf_map_lookup_elem(fd, ctypes.byref(key), ctypes.byref(val))
+            if r == 0:
+                yield key, val
+            ret = libbpf.bpf_map_get_next_key(fd, ctypes.byref(key), ctypes.byref(next_key))
+
+    def read_outstanding_map(self):
+        fd = self._get_map_fd("mem", b"outstanding_map")
+        if fd < 0:
+            return {}
+        key = OutstandingKey()
+        next_key = OutstandingKey()
+        val = OutstandingVal()
+        stats = {}
+        dead_keys = []
+        ret = libbpf.bpf_map_get_next_key(fd, None, ctypes.byref(next_key))
+        while ret == 0:
+            ctypes.memmove(ctypes.byref(key), ctypes.byref(next_key), ctypes.sizeof(OutstandingKey))
+            r = libbpf.bpf_map_lookup_elem(fd, ctypes.byref(key), ctypes.byref(val))
+            if r == 0:
+                pid = int(key.pid)
+                if os.path.exists("/proc/%d" % pid):
+                    scnt = min(int(val.stack_cnt), STACK_MAX) if val.stack_cnt > 0 else 0
+                    sid = tuple(int(key.stack_addrs[i]) for i in range(scnt)) if scnt > 0 else ()
+                    addrs = [int(key.stack_addrs[i]) for i in range(scnt)]
+                    if pid not in stats:
+                        stats[pid] = {}
+                    stats[pid][sid] = {
+                        "alloc_bytes": int(val.alloc_bytes),
+                        "free_bytes": int(val.free_bytes),
+                        "comm": val.comm.decode("utf-8", errors="replace"),
+                        "stack_addrs": addrs,
+                        "stack_cnt": scnt,
+                    }
+                else:
+                    dk = OutstandingKey()
+                    ctypes.memmove(ctypes.byref(dk), ctypes.byref(key), ctypes.sizeof(OutstandingKey))
+                    dead_keys.append(dk)
+            ret = libbpf.bpf_map_get_next_key(fd, ctypes.byref(key), ctypes.byref(next_key))
+        for dk in dead_keys:
+            libbpf.bpf_map_delete_elem(fd, ctypes.byref(dk))
+        return stats
+
+    def read_fd_count_map(self):
+        fd = self._get_map_fd("fd", b"fd_count_map")
+        if fd < 0:
+            return {}
+        key = FdCountKey()
+        next_key = FdCountKey()
+        val = FdCountVal()
+        stats = {}
+        dead_keys = []
+        ret = libbpf.bpf_map_get_next_key(fd, None, ctypes.byref(next_key))
+        while ret == 0:
+            ctypes.memmove(ctypes.byref(key), ctypes.byref(next_key), ctypes.sizeof(FdCountKey))
+            r = libbpf.bpf_map_lookup_elem(fd, ctypes.byref(key), ctypes.byref(val))
+            if r == 0:
+                pid = int(key.pid)
+                if os.path.exists("/proc/%d" % pid):
+                    scnt = min(int(val.stack_cnt), STACK_MAX) if val.stack_cnt > 0 else 0
+                    addrs = [int(val.stack_addrs[i]) for i in range(scnt)]
+                    stats[pid] = {
+                        "open_count": int(val.open_count),
+                        "close_count": int(val.close_count),
+                        "comm": val.comm.decode("utf-8", errors="replace"),
+                        "stack_addrs": addrs,
+                        "stack_cnt": scnt,
+                    }
+                else:
+                    dk = FdCountKey()
+                    ctypes.memmove(ctypes.byref(dk), ctypes.byref(key), ctypes.sizeof(FdCountKey))
+                    dead_keys.append(dk)
+            ret = libbpf.bpf_map_get_next_key(fd, ctypes.byref(key), ctypes.byref(next_key))
+        for dk in dead_keys:
+            libbpf.bpf_map_delete_elem(fd, ctypes.byref(dk))
+        return stats
+
+    def clean_dead_pid_allocs(self):
+        """清理 allocs map 中已退出进程的条目。"""
+        fd = self._get_map_fd("mem", b"allocs")
+        if fd < 0:
+            return 0
+        key = AllocsKey()
+        next_key = AllocsKey()
+        val = AllocsVal()
+        dead_keys = []
+        ret = libbpf.bpf_map_get_next_key(fd, None, ctypes.byref(next_key))
+        while ret == 0:
+            ctypes.memmove(ctypes.byref(key), ctypes.byref(next_key), ctypes.sizeof(AllocsKey))
+            r = libbpf.bpf_map_lookup_elem(fd, ctypes.byref(key), ctypes.byref(val))
+            if r == 0:
+                pid = int(val.pid)
+                if pid > 0 and not os.path.exists("/proc/%d" % pid):
+                    dk = AllocsKey()
+                    ctypes.memmove(ctypes.byref(dk), ctypes.byref(key), ctypes.sizeof(AllocsKey))
+                    dead_keys.append(dk)
+            ret = libbpf.bpf_map_get_next_key(fd, ctypes.byref(key), ctypes.byref(next_key))
+        for dk in dead_keys:
+            libbpf.bpf_map_delete_elem(fd, ctypes.byref(dk))
+        return len(dead_keys)
+
+    def clean_dead_pid_fd_map(self):
+        """清理 fd_map 中已退出进程的条目。"""
+        fd = self._get_map_fd("fd", b"fd_map")
+        if fd < 0:
+            return 0
+        key = FdKey()
+        next_key = FdKey()
+        val = FdVal()
+        dead_keys = []
+        ret = libbpf.bpf_map_get_next_key(fd, None, ctypes.byref(next_key))
+        while ret == 0:
+            ctypes.memmove(ctypes.byref(key), ctypes.byref(next_key), ctypes.sizeof(FdKey))
+            r = libbpf.bpf_map_lookup_elem(fd, ctypes.byref(key), ctypes.byref(val))
+            if r == 0:
+                pid = int(key.pid)
+                if pid > 0 and not os.path.exists("/proc/%d" % pid):
+                    dk = FdKey()
+                    ctypes.memmove(ctypes.byref(dk), ctypes.byref(key), ctypes.sizeof(FdKey))
+                    dead_keys.append(dk)
+            ret = libbpf.bpf_map_get_next_key(fd, ctypes.byref(key), ctypes.byref(next_key))
+        for dk in dead_keys:
+            libbpf.bpf_map_delete_elem(fd, ctypes.byref(dk))
+        return len(dead_keys)
 
     def cleanup(self):
         """清理 BPF 对象。"""

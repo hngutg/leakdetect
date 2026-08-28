@@ -1,10 +1,8 @@
 ﻿"""内存泄露检测器：OLS 斜率 + 显著性 + 状态生命周期 + 防抖。
 
 对应里程碑：B1 + B2（B2 重构为继承 TrendLeakDetector）
-精度专项：per-PID 聚合（key=pid，跨栈求和）+ 增长 sid 栈归因 + 排自身 PID。
+精度专项：per-PID 聚合（key=pid，跨栈求和）+ 增长 sid 栈归因。
 """
-
-import os
 
 from analyzer.base import TrendLeakDetector
 
@@ -36,13 +34,10 @@ class MemoryLeakDetector(TrendLeakDetector):
         per-PID 聚合：跨栈求和 ×100（无偏估计）；key=pid → 每进程 1 状态机/1 告警。
         栈归因：取 Δ outstanding 最大的 sid（增长调用点）；无增长则取最大 outstanding sid。
         锁内拷贝，锁外 yield，避免阻塞 BPF 回调。"""
-        my_pid = os.getpid()
         with aggregator._lock:
             data = []
             live = set()
             for pid, stacks in aggregator.mem_stats.items():
-                if pid == my_pid:
-                    continue                        # 排自身（leakdetect 不告自己）
                 total = 0
                 best_sid = None
                 best_delta = 0
