@@ -25,6 +25,7 @@ from symbolizer.symbols import Symbolizer
 from analyzer.memory import MemoryLeakDetector
 from analyzer.threads import ThreadLeakDetector
 from analyzer.handles import HandleLeakDetector
+from analyzer.mmap import MmapLeakDetector
 from analyzer.cpu import CpuMonitor
 from storage.db import Database
 from alert_logging.alert_logger import AlertLogger
@@ -41,6 +42,7 @@ class Backend:
         self.analyzer_mem = MemoryLeakDetector(config)
         self.analyzer_threads = ThreadLeakDetector(config)
         self.analyzer_fd = HandleLeakDetector(config)
+        self.analyzer_mmap = MmapLeakDetector(config)
         self.db = Database(config["storage"]["sqlite_path"])
         self.logger = AlertLogger(config["logging"]["alert_log"])
         self.cpu_monitor = CpuMonitor(config["sampling"]["cpu_interval"])
@@ -89,18 +91,20 @@ class Backend:
             try:
                 self.aggregator.set_mem_stats(self.loader.read_outstanding_map())
                 self.aggregator.set_fd_stats(self.loader.read_fd_count_map())
+                self.aggregator.set_mmap_stats(*self.loader.read_mmap_outstanding_map())
             except Exception as e:
                 print("[backend] map_reader error: %s" % e)
             time.sleep(1)
 
     def _dead_pid_cleaner_loop(self):
-        """每 60s 清理 allocs/fd_map 中已退出进程的条目。"""
+        """每 60s 清理 allocs/fd_file_map 中已退出进程的条目。"""
         while True:
             try:
                 n1 = self.loader.clean_dead_pid_allocs()
-                n2 = self.loader.clean_dead_pid_fd_map()
-                if n1 + n2 > 0:
-                    print("[backend] cleaned %d allocs + %d fd_map dead pid entries" % (n1, n2))
+                n2 = self.loader.clean_dead_pid_fd_file_map()
+                n3 = self.loader.clean_dead_tid_mmap_entry_info()
+                if n1 + n2 + n3 > 0:
+                    print("[backend] cleaned %d allocs + %d fd_file_map + %d mmap_entry dead entries" % (n1, n2, n3))
             except Exception as e:
                 print("[backend] dead pid cleaner error: %s" % e)
             time.sleep(60)
@@ -112,8 +116,10 @@ class Backend:
                 self.analyzer_mem.cleanup_dead_states()
                 self.analyzer_threads.cleanup_dead_states()
                 self.analyzer_fd.cleanup_dead_states()
+                self.analyzer_mmap.cleanup_dead_states()
                 alerts = []
                 alerts += self.analyzer_mem.check(self.aggregator, self.symbolizer)
+                alerts += self.analyzer_mmap.check(self.aggregator, self.symbolizer)
                 alerts += self.analyzer_threads.check(self.aggregator, self.symbolizer)
                 alerts += self.analyzer_fd.check(self.aggregator, self.symbolizer)
                 for a in alerts:
@@ -137,6 +143,8 @@ class Backend:
             try:
                 for p in self.aggregator.get_per_process_mem()[:5]:
                     self.db.write_sample("mem", p["pid"], p["value"])
+                for p in self.aggregator.get_per_process_mmap()[:5]:
+                    self.db.write_sample("mmap", p["pid"], p["value"])
                 for p in self.aggregator.get_per_process_thread()[:5]:
                     self.db.write_sample("thread", p["pid"], p["value"])
                 for p in self.aggregator.get_per_process_fd()[:5]:
@@ -153,6 +161,7 @@ class Backend:
         if self.display_target is not None and not tpids:
             print("[backend] target %s not found (stopped?), showing empty" % self.display_target)
         mem_all = self.aggregator.get_per_process_mem()
+        mmap_all = self.aggregator.get_per_process_mmap()
         thr_all = self.aggregator.get_per_process_thread()
         fd_all = self.aggregator.get_per_process_fd()
         cpu_all = self.cpu_stats
@@ -165,26 +174,30 @@ class Backend:
             return result
 
         alerts = [a for a in (self.analyzer_mem.get_active_alerts()
+                  + self.analyzer_mmap.get_active_alerts()
                   + self.analyzer_threads.get_active_alerts()
                   + self.analyzer_fd.get_active_alerts()) if a["pid"] in tpids]
         _mem = sum(p["value"] for p in mem_all if p["pid"] in tpids)
+        _mmap = sum(p["value"] for p in mmap_all if p["pid"] in tpids)
         _thread = sum(p["value"] for p in thr_all if p["pid"] in tpids)
         _fd = sum(p["value"] for p in fd_all if p["pid"] in tpids)
         _cpu = sum(p["value"] for p in cpu_all if p["pid"] in tpids)
-        print("[debug] target=%s mem=%d thread=%d fd=%d cpu=%d" % (
-            self.display_target or "host", _mem, _thread, _fd, _cpu))
+        print("[debug] target=%s mem=%d mmap=%d thread=%d fd=%d cpu=%d" % (
+            self.display_target or "host", _mem, _mmap, _thread, _fd, _cpu))
         return {
             "type": "dashboard_update",
             "timestamp": now,
             "filter": {"container_id": self.display_target, "pid": None},
             "latest_points": {
                 "mem": {"t": now, "v": _mem},
+                "mmap": {"t": now, "v": _mmap},
                 "thread": {"t": now, "v": _thread},
                 "fd": {"t": now, "v": _fd},
                 "cpu": {"t": now, "v": _cpu},
             },
             "per_process": {
                 "mem": _top5(mem_all),
+                "mmap": _top5(mmap_all),
                 "thread": _top5(thr_all),
                 "fd": _top5(fd_all),
                 "cpu": _top5(cpu_all),
@@ -235,6 +248,17 @@ class Backend:
                 "grace_seconds": self.analyzer_fd.grace_seconds,
                 "confirm_seconds": self.analyzer_fd.confirm_seconds,
             },
+            "mmap": {
+                "outstanding_delta_bytes": self.analyzer_mmap.threshold,
+                "observe_seconds": self.analyzer_mmap.observe_seconds,
+                "leak_seconds": self.analyzer_mmap.leak_seconds,
+                "clear_ratio": self.analyzer_mmap.clear_ratio,
+                "clear_seconds": self.analyzer_mmap.clear_seconds,
+                "resolve_seconds": self.analyzer_mmap.resolve_seconds,
+                "stabilize_seconds": self.analyzer_mmap.stabilize_seconds,
+                "grace_seconds": self.analyzer_mmap.grace_seconds,
+                "confirm_seconds": self.analyzer_mmap.confirm_seconds,
+            },
             "cpu": {"cpu_interval": self.cpu_monitor.interval},
             "sampling_rate": self.config["sampling"]["mem"],
         }
@@ -245,6 +269,7 @@ class Backend:
             "mem": self.analyzer_mem,
             "thread": self.analyzer_threads,
             "fd": self.analyzer_fd,
+            "mmap": self.analyzer_mmap,
         }
         param_map = {
             "outstanding_delta_bytes": "threshold",

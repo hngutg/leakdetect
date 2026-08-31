@@ -39,6 +39,30 @@ struct {
     __uint(max_entries, 1000000);
 } outstanding_map SEC(".maps");
 
+/* mmap per-(pid,stack) 分配追踪（复用 outstanding_key_t/outstanding_val_t） */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct outstanding_key_t);
+    __type(value, struct outstanding_val_t);
+    __uint(max_entries, 1000000);
+} mmap_outstanding_map SEC(".maps");
+
+/* mmap per-PID 释放计数（munmap 无匹配栈） */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct mmap_free_key_t);
+    __type(value, struct mmap_free_val_t);
+    __uint(max_entries, 1000000);
+} mmap_free_map SEC(".maps");
+
+/* mmap entry→return 暂存 */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, u32);
+    __type(value, struct mmap_entry_info_t);
+    __uint(max_entries, 10000);
+} mmap_entry_info SEC(".maps");
+
 /* malloc entry: 采样 + 记录 size + 捕获栈 */
 SEC("uprobe")
 int trace_malloc_entry(struct pt_regs *ctx) {
@@ -60,31 +84,7 @@ int trace_malloc_entry(struct pt_regs *ctx) {
     if (info.stack_cnt > STACK_MAX_FRAMES) info.stack_cnt = STACK_MAX_FRAMES;
 
     u64 ra = 0;
-    if (bpf_probe_read_user(&ra, sizeof(ra), (void *)PT_REGS_SP(ctx)) == 0 && ra != 0) {
-        int scnt = info.stack_cnt;
-        if (scnt > STACK_MAX_FRAMES) scnt = STACK_MAX_FRAMES;
-        int dup = 0;
-        int i;
-        for (i = 0; i < scnt; i++) {
-            if (info.stack_addrs[i] == ra) { dup = 1; break; }
-        }
-        if (!dup) {
-            if (scnt == 0) {
-                info.stack_addrs[0] = ra;
-                info.stack_cnt = 1;
-            } else {
-                int new_cnt = scnt + 1;
-                if (new_cnt > STACK_MAX_FRAMES) new_cnt = STACK_MAX_FRAMES;
-                for (i = STACK_MAX_FRAMES - 1; i >= 2; i--) {
-                    if (i < new_cnt) {
-                        info.stack_addrs[i] = info.stack_addrs[i - 1];
-                    }
-                }
-                info.stack_addrs[1] = ra;
-                info.stack_cnt = new_cnt;
-            }
-        }
-    }
+    fixup_return_addr(ctx, info.stack_addrs, &info.stack_cnt);
 
     bpf_map_update_elem(&entry_info, &tid, &info, BPF_ANY);
     return 0;
@@ -175,6 +175,113 @@ int trace_free_entry(struct pt_regs *ctx) {
         }
     } else {
         __sync_fetch_and_add(&info->refcount, 1);
+    }
+    return 0;
+}
+
+/* ======== mmap/munmap/mremap 追踪（全量，不采样）======== */
+
+SEC("uprobe")
+int trace_mmap_entry(struct pt_regs *ctx) {
+    u64 flags = PT_REGS_PARM4(ctx);
+    if (!(flags & MAP_ANONYMOUS_)) return 0;
+    u32 tid = (u32)bpf_get_current_pid_tgid();
+    struct mmap_entry_info_t info = {};
+    info.length = PT_REGS_PARM2(ctx);
+    info.pid = (u32)(bpf_get_current_pid_tgid() >> 32);
+    int ret = bpf_get_stack(ctx, info.stack_addrs, sizeof(info.stack_addrs), BPF_F_USER_STACK);
+    info.stack_cnt = (ret >= 0) ? ret / (int)sizeof(u64) : 0;
+    if (info.stack_cnt > STACK_MAX_FRAMES) info.stack_cnt = STACK_MAX_FRAMES;
+    fixup_return_addr(ctx, info.stack_addrs, &info.stack_cnt);
+    bpf_map_update_elem(&mmap_entry_info, &tid, &info, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe")
+int trace_mmap_return(struct pt_regs *ctx) {
+    u64 ptr = PT_REGS_RC(ctx);
+    if (ptr == (u64)-1) {
+        u32 tid = (u32)bpf_get_current_pid_tgid();
+        bpf_map_delete_elem(&mmap_entry_info, &tid);
+        return 0;
+    }
+    u32 tid = (u32)bpf_get_current_pid_tgid();
+    struct mmap_entry_info_t *info = bpf_map_lookup_elem(&mmap_entry_info, &tid);
+    if (!info) return 0;
+    u64 pid = bpf_get_current_pid_tgid() >> 32;
+    struct outstanding_key_t key = {};
+    key.pid = pid;
+    int j;
+    for (j = 0; j < STACK_MAX_FRAMES; j++) key.stack_addrs[j] = info->stack_addrs[j];
+    struct outstanding_val_t *val = bpf_map_lookup_elem(&mmap_outstanding_map, &key);
+    if (!val) {
+        struct outstanding_val_t zero = {};
+        bpf_map_update_elem(&mmap_outstanding_map, &key, &zero, BPF_ANY);
+        val = bpf_map_lookup_elem(&mmap_outstanding_map, &key);
+    }
+    if (val) {
+        __sync_fetch_and_add(&val->alloc_bytes, info->length);
+        bpf_get_current_comm(val->comm, sizeof(val->comm));
+        val->stack_cnt = info->stack_cnt;
+    }
+    bpf_map_delete_elem(&mmap_entry_info, &tid);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_munmap")
+int trace_munmap_entry(struct sys_enter_args *ctx) {
+    u64 length = ctx->args[1];
+    u64 pid = bpf_get_current_pid_tgid() >> 32;
+    struct mmap_free_key_t key = {};
+    key.pid = pid;
+    struct mmap_free_val_t *val = bpf_map_lookup_elem(&mmap_free_map, &key);
+    if (!val) {
+        struct mmap_free_val_t zero = {};
+        bpf_map_update_elem(&mmap_free_map, &key, &zero, BPF_ANY);
+        val = bpf_map_lookup_elem(&mmap_free_map, &key);
+    }
+    if (val) {
+        __sync_fetch_and_add(&val->free_bytes, length);
+    }
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_mremap")
+int trace_mremap_entry(struct sys_enter_args *ctx) {
+    u64 old_size = ctx->args[1];
+    u64 new_size = ctx->args[2];
+    u64 pid = bpf_get_current_pid_tgid() >> 32;
+    if (new_size > old_size) {
+        u64 delta = new_size - old_size;
+        struct outstanding_key_t key = {};
+        key.pid = pid;
+        int ret = bpf_get_stack(ctx, key.stack_addrs, sizeof(key.stack_addrs), BPF_F_USER_STACK);
+        int scnt = (ret >= 0) ? ret / (int)sizeof(u64) : 0;
+        if (scnt > STACK_MAX_FRAMES) scnt = STACK_MAX_FRAMES;
+        struct outstanding_val_t *val = bpf_map_lookup_elem(&mmap_outstanding_map, &key);
+        if (!val) {
+            struct outstanding_val_t zero = {};
+            bpf_map_update_elem(&mmap_outstanding_map, &key, &zero, BPF_ANY);
+            val = bpf_map_lookup_elem(&mmap_outstanding_map, &key);
+        }
+        if (val) {
+            __sync_fetch_and_add(&val->alloc_bytes, delta);
+            bpf_get_current_comm(val->comm, sizeof(val->comm));
+            val->stack_cnt = scnt;
+        }
+    } else if (old_size > new_size) {
+        u64 delta = old_size - new_size;
+        struct mmap_free_key_t fkey = {};
+        fkey.pid = pid;
+        struct mmap_free_val_t *fval = bpf_map_lookup_elem(&mmap_free_map, &fkey);
+        if (!fval) {
+            struct mmap_free_val_t zero = {};
+            bpf_map_update_elem(&mmap_free_map, &fkey, &zero, BPF_ANY);
+            fval = bpf_map_lookup_elem(&mmap_free_map, &fkey);
+        }
+        if (fval) {
+            __sync_fetch_and_add(&fval->free_bytes, delta);
+        }
     }
     return 0;
 }

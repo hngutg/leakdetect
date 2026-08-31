@@ -10,7 +10,7 @@ const MonitoringConfigPage = {
       samplingRate: 100,
       sections: [
         {
-          title: '内存', icon: '💾', resource: 'mem',
+          title: '堆内存(malloc)', icon: '💾', resource: 'mem',
           params: [
             { key: 'outstanding_delta_bytes', label: '增长斜率阈值', value: 10240, unit: '字节/秒',
               desc: 'outstanding 净增长斜率（字节/秒）需超过此值且统计显著才可能告警。值越大越不易误报，但小速率泄露会漏检。默认 10KB/s（mem_leak 40KB/s 命中）。可调' },
@@ -83,6 +83,29 @@ const MonitoringConfigPage = {
           params: [
             { key: 'cpu_interval', label: '轮询间隔', value: 1, unit: '秒',
               desc: '每 N 秒读取一次 /proc/[pid]/stat 计算 CPU 占用率。值越小越实时但系统开销越大。默认 1 秒' }
+          ]
+        },
+        {
+          title: '映射内存(mmap)', icon: '🗂️', resource: 'mmap',
+          params: [
+            { key: 'outstanding_delta_bytes', label: '增长斜率阈值', value: 10240, unit: '字节/秒',
+              desc: 'mmap outstanding 净增长斜率（字节/秒）需超过此值且统计显著才可能告警。全量追踪（无采样），值为精确值' },
+            { key: 'grace_seconds', label: '启动宽限期', value: 120, unit: '秒',
+              desc: '新进程前 N 秒只攒历史不判定，防启动期 mmap 误报' },
+            { key: 'confirm_seconds', label: '确认时长', value: 240, unit: '秒',
+              desc: '疑似→确认：LEAK 持续此时长且仍 leaking 才升"确认泄露"' },
+            { key: 'observe_seconds', label: '观察期时长', value: 30, unit: '秒',
+              desc: 'mmap outstanding 开始增长后的观察期' },
+            { key: 'leak_seconds', label: '趋势检测窗口', value: 60, unit: '秒',
+              desc: '趋势检测窗口时长。OLS 斜率在此窗口上计算' },
+            { key: 'clear_ratio', label: '恢复比例', value: 0.5, unit: '',
+              desc: '泄露告警后 mmap outstanding 需下降到峰值 × 此比例以下才认为"已恢复"' },
+            { key: 'clear_seconds', label: '恢复确认时长', value: 30, unit: '秒',
+              desc: 'mmap outstanding 降到恢复比例以下后需持续此时长才确认恢复' },
+            { key: 'resolve_seconds', label: '清除时长', value: 60, unit: '秒',
+              desc: '"已恢复"状态持续此时长后告警从列表中消失' },
+            { key: 'stabilize_seconds', label: '稳定消除时长', value: 300, unit: '秒',
+              desc: '泄露告警后 mmap outstanding 稳定不再增长，此时长后自动消除告警' }
           ]
         }
       ]

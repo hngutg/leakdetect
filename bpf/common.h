@@ -10,6 +10,7 @@
 #include <linux/ptrace.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
 
 typedef __u32 u32;
 typedef __u64 u64;
@@ -82,6 +83,14 @@ struct fd_value_t {
     u64 stack_addrs[STACK_MAX_FRAMES];
 };
 
+/* fd_file_map 的 value：file 指针追踪（全局 key，跨进程） */
+struct fd_file_val_t {
+    u32 opener_pid;
+    int fd;
+    int stack_cnt;
+    u64 stack_addrs[STACK_MAX_FRAMES];
+};
+
 /* outstanding_map 的 key：per-(pid,stack) 内存聚合 */
 struct outstanding_key_t {
     u64 pid;
@@ -95,6 +104,44 @@ struct outstanding_val_t {
     char comm[16];
     int stack_cnt;
 };
+
+#define MAP_ANONYMOUS_ 0x20
+
+/* mmap entry→return 暂存（含 pid 用于死进程清理，同 alloc_info_t 模式） */
+struct mmap_entry_info_t {
+    u64 length;
+    int stack_cnt;
+    u64 stack_addrs[STACK_MAX_FRAMES];
+    u32 pid;
+};
+
+/* mmap_free_map key/value（per-PID munmap 聚合） */
+struct mmap_free_key_t { u64 pid; };
+struct mmap_free_val_t { u64 free_bytes; };
+
+/* [RSP] 补帧内联函数（malloc/mmap/mremap 共用） */
+static __always_inline void fixup_return_addr(struct pt_regs *ctx,
+                                                u64 *addrs, int *cnt) {
+    u64 ra = 0;
+    if (bpf_probe_read_user(&ra, sizeof(ra), (void *)PT_REGS_SP(ctx)) == 0 && ra != 0) {
+        int scnt = *cnt;
+        if (scnt > STACK_MAX_FRAMES) scnt = STACK_MAX_FRAMES;
+        int dup = 0, i;
+        for (i = 0; i < scnt; i++) {
+            if (addrs[i] == ra) { dup = 1; break; }
+        }
+        if (!dup) {
+            if (scnt == 0) { addrs[0] = ra; *cnt = 1; }
+            else {
+                int nc = scnt + 1;
+                if (nc > STACK_MAX_FRAMES) nc = STACK_MAX_FRAMES;
+                for (i = STACK_MAX_FRAMES - 1; i >= 2; i--)
+                    if (i < nc) addrs[i] = addrs[i - 1];
+                addrs[1] = ra; *cnt = nc;
+            }
+        }
+    }
+}
 
 /* fd_count_map 的 key：per-pid fd 计数 */
 struct fd_count_key_t {

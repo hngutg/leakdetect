@@ -12,16 +12,18 @@ const app = createApp({
 
         const resources = reactive({
             mem:    { current: 0, status: "normal" },
+            mmap:   { current: 0, status: "normal" },
             thread: { current: 0, status: "normal" },
             fd:     { current: 0, status: "normal" },
             cpu:    { current: 0, status: "normal" },
         });
 
-        const resourceOrder = ["cpu", "mem", "thread", "fd"];
+        const resourceOrder = ["cpu", "mem", "mmap", "thread", "fd"];
 
         // F2: 图表数据
         const chartData = reactive({
             mem:    { range: "1d", series: [], loading: false },
+            mmap:   { range: "1d", series: [], loading: false },
             thread: { range: "1d", series: [], loading: false },
             fd:     { range: "1d", series: [], loading: false },
             cpu:    { range: "1d", series: [], loading: false },
@@ -43,7 +45,7 @@ const app = createApp({
 
         // F4: 原始数据（未过滤）
         const rawPerProcess = reactive({
-            mem: [], thread: [], fd: [], cpu: []
+            mem: [], mmap: [], thread: [], fd: [], cpu: []
         });
         const rawAlerts = ref([]);
 
@@ -121,6 +123,7 @@ const app = createApp({
         function handleDashboardUpdate(data) {
             if (data.latest_points) {
                 resources.mem.current = data.latest_points.mem.v;
+                resources.mmap.current = data.latest_points.mmap.v;
                 resources.thread.current = data.latest_points.thread.v;
                 resources.fd.current = data.latest_points.fd.v;
                 resources.cpu.current = data.latest_points.cpu.v;
@@ -136,6 +139,7 @@ const app = createApp({
             // F4: 存原始 per_process
             if (data.per_process) {
                 rawPerProcess.mem = data.per_process.mem || [];
+                rawPerProcess.mmap = data.per_process.mmap || [];
                 rawPerProcess.thread = data.per_process.thread || [];
                 rawPerProcess.fd = data.per_process.fd || [];
                 rawPerProcess.cpu = data.per_process.cpu || [];
@@ -150,7 +154,7 @@ const app = createApp({
 
         function formatValue(resource, v) {
             if (v === undefined || v === null) return "-";
-            if (resource === "mem") {
+            if (resource === "mem" || resource === "mmap") {
                 return (v / 1024 / 1024).toFixed(1) + " MB";
             }
             if (resource === "cpu") {
@@ -164,7 +168,7 @@ const app = createApp({
         }
 
         function resourceLabel(r) {
-            return { mem: "内存", thread: "线程", fd: "句柄", cpu: "CPU" }[r] || r;
+            return { mem: "堆内存(malloc)", mmap: "映射内存(mmap)", thread: "线程", fd: "句柄", cpu: "CPU" }[r] || r;
         }
 
         function formatTime(ts) {

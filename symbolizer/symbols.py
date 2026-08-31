@@ -60,6 +60,10 @@ class Symbolizer:
                     end = int(addr_range[1], 16)
                     offset = int(parts[2], 16)
                     path = parts[5]
+                    if not os.path.exists(path):
+                        root_path = "/proc/%d/root%s" % (pid, path)
+                        if os.path.exists(root_path):
+                            path = root_path
                     result.append((start, end, offset, path))
         except (IOError, ValueError):
             pass

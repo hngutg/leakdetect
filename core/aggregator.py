@@ -23,6 +23,8 @@ class Aggregator:
         self.thread_stats = {}
         # 句柄: {pid: {open_count, close_count, comm, stack_addrs, stack_cnt}}
         self.fd_stats = {}
+        self.mmap_stats = {}
+        self.mmap_free_stats = {}
 
     # ========== 内存（B1） ==========
 
@@ -94,6 +96,22 @@ class Aggregator:
             return sum(max(0, s["open_count"] - s["close_count"])
                       for s in self.fd_stats.values())
 
+    def set_mmap_stats(self, stats, free_stats):
+        with self._lock:
+            self.mmap_stats = stats
+            self.mmap_free_stats = free_stats
+
+    def get_per_process_mmap(self):
+        result = []
+        with self._lock:
+            for pid, stacks in self.mmap_stats.items():
+                total_alloc = sum(s["alloc_bytes"] for s in stacks.values())
+                free_bytes = self.mmap_free_stats.get(pid, 0)
+                total = max(0, total_alloc - free_bytes)
+                comm = next(iter(stacks.values()))["comm"] if stacks else ""
+                result.append({"pid": pid, "name": comm, "value": total})
+        return sorted(result, key=lambda x: x["value"], reverse=True)
+
     def get_per_process_fd(self):
         result = []
         with self._lock:
@@ -113,9 +131,13 @@ class Aggregator:
             all_pids = set(self.mem_stats.keys())
             all_pids.update(self.thread_stats.keys())
             all_pids.update(self.fd_stats.keys())
+            all_pids.update(self.mmap_stats.keys())
+            all_pids.update(self.mmap_free_stats.keys())
             dead = [pid for pid in all_pids
                     if not os.path.exists("/proc/%d" % pid)]
             for pid in dead:
                 self.mem_stats.pop(pid, None)
                 self.thread_stats.pop(pid, None)
                 self.fd_stats.pop(pid, None)
+                self.mmap_stats.pop(pid, None)
+                self.mmap_free_stats.pop(pid, None)

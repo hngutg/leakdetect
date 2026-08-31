@@ -24,6 +24,10 @@
 | 12 | 测试程序帧指针 + Python 泄露脚本 | `tools/package_arm.sh` 5 个测试程序加 `-fno-omit-frame-pointer`（减少 BPF 帧指针链断裂导致的垃圾帧）；新增 `tests/leak_programs/py_leak.py`（ctypes 调 libc malloc，测试 Python 进程泄露检测） | ARM 验证：垃圾帧减少；py_leak 告警触发 |
 | 13 | P3 值算法不一致（根因 B） | `core/aggregator.py` 三处 sum-then-clamp → per-sid/per-entry clamp：`get_total_outstanding`/`get_total_thread_count`/`get_total_fd_count` | `tests/verify_p3.py` 11 场景全 PASS（x86 VM 验证） |
 | 14 | P4 /api/alerts 接 DB | `storage/db.py` 新增 `query_alerts`；`web/backend.py` 新增 `get_alerts`；`web/api.py:36` 改为调 `_backend.get_alerts(range_tag)` | x86 VM 集成验证：DB 608 条告警 → API 返回真实告警列表（含栈） |
+| 15 | P2 全 libc uprobe（容器内存监控） | `core/loader.py`：`_discover_all_libcs` 扫描 `/proc/[pid]/maps` 发现所有 libc（含容器），按 inode 去重；`_attach_all_libc_uprobes` 全有或全无策略挂载；`_libc_reenum_loop` 60s 重枚举；`symbolizer/symbols.py`：`_parse_maps` 加 `/proc/[pid]/root/` 前缀 | ARM 验证：17 个 libc uprobe 全挂载成功 |
+| 16 | P2 PIE 偏移修正 | `core/loader.py`：`_find_symbol_offset` 用 PT_LOAD 段将虚拟地址转文件偏移；优先 `.dynsym` | ARM 验证：9 个容器 libc 从 `Invalid argument` → 正确偏移 |
+| 17 | mmap/munmap/mremap 全量追踪 | `bpf/mem.bpf.c`：3 新 map + 4 新 BPF 程序；`analyzer/mmap.py`：`MmapLeakDetector`；前端加"映射内存(mmap)"卡片 | x86 VM 验证：mmap 值非 0，卡片正常显示 |
+| 18 | munmap/mremap uprobe→tracepoint | glibc `free()` 用 `INLINE_SYSCALL(munmap)` 绕过 libc 函数 → uprobe 漏抓。改 `trace_munmap_entry`/`trace_mremap_entry` 为 `SEC("tracepoint/syscalls/sys_enter_munmap/mremap")` | x86 VM 验证：tracepoint 挂载成功，munmap 追踪生效 |
 
 ---
 
@@ -297,6 +301,8 @@ build-id 不匹配 → 文件不存在 → 返回 None → 走兜底（库名+�
 | 2026-08-26 | 测试程序帧指针 + py_leak.py | package_arm.sh + py_leak.py |
 | 2026-08-27 | P3 值算法不一致（sum-then-clamp → per-sid clamp） | 0826 文档 §二 P3 |
 | 2026-08-28 | P4 /api/alerts 接 DB（query_alerts + get_alerts） | 0826 文档 §二 P4 |
+| 2026-08-29 | P2 全 libc uprobe + PIE 偏移修正 | loader.py |
+| 2026-08-29 | mmap/munmap/mremap 全量追踪 + tracepoint 修正 | mem.bpf.c + loader.py + analyzer/mmap.py |
 
 ---
 
@@ -311,7 +317,115 @@ sampler 修复 ✅ + 死 pid 清理器 ✅ + 栈符号解析(Tier 1/2/兜底) �
     ↓ （有 per-pid RSS 全量历史）
 Tier-2 慢泄露检测（RSS 长基线 delta）
     ↓ （容器 mem 有值才完整）
-Phase 2 全 libc uprobe（P2, ~3-5 天）
+Phase 2 全 libc uprobe（P2, ~3-5 天）✅ + mmap 全量追踪 ✅  ← 均已完成
     ↓
 黑白名单（P5）/ 导出功能（P6）/ 可选增强
 ```
+
+---
+
+## 七、堆内存(malloc) vs 映射内存(mmap) 双维度监控说明
+
+> 2026-08-29 增补
+> 用途：说明两个内存卡片的定义、监控范围、重叠关系及使用方法。
+
+### 7.1 两个维度定义
+
+| | 堆内存(malloc) | 映射内存(mmap) |
+|---|---|---|
+| **追踪机制** | uprobe libc `malloc`/`free` 函数 | uprobe libc `mmap` 函数 + tracepoint `sys_enter_munmap`/`sys_enter_mremap` |
+| **BPF Map** | `outstanding_map`（per-{pid,stack}） | `mmap_outstanding_map`（per-{pid,stack} alloc）+ `mmap_free_map`（per-pid free） |
+| **采样** | 1/100 采样 ×100 补偿 | **全量**（无采样，精确值） |
+| **值含义** | malloc 层未归还量（虚拟） | mmap 层未归还量（虚拟，含 demand-paged 未访问页） |
+| **告警阈值** | 10KB/s 斜率 | 10KB/s 斜率 |
+| **栈归因** | 用户的 `malloc()` 调用点 | 用户的 `mmap()` 调用点（或 glibc 内部 mmap） |
+
+### 7.2 监控范围对比（重叠分析）
+
+两个卡片追踪不同层次的内存分配，但 glibc 对大块 malloc（>128KB）内部用 mmap 向 OS 要内存，导致同一分配在两个卡片各记一次：
+
+| 分配场景 | 堆内存(malloc) | 映射内存(mmap) | 重叠? | 说明 |
+|---|---|---|---|---|
+| `malloc(1KB)` 小分配（glibc 用 brk） | ✅ | ❌ | 不重叠 | glibc 用 brk 扩展堆，不走 mmap |
+| `malloc(1MB)` 大分配（glibc 内部用 mmap） | ✅ malloc uprobe | ✅ mmap uprobe | **重叠** | 同一块内存两边各记一次 |
+| 直接调 `mmap()`（模型加载/共享内存） | ❌ | ✅ | 不重叠 | 不走 malloc |
+| 线程栈（pthread 用 mmap） | ❌ | ✅ | 不重叠 | glibc 创建线程时 mmap 栈空间 |
+| glibc 线程 arena（~64MB/线程） | ❌ | ✅ | 不重叠 | glibc 为每个线程创建 mmap'd arena |
+
+**重叠图示**：
+
+```
+┌─────────────────────────────────────────┐
+│         映射内存(mmap) 全部范围           │
+│  ┌─────────────┐ ┌────────┐ ┌────────┐  │
+│  │ glibc 内部   │ │ 线程栈  │ │ arena  │  │
+│  │ mmap(大malloc)│ │        │ │        │  │
+│  └──────┬───────┘ └────────┘ └────────┘  │
+│         │ 重叠                             │
+│  ┌──────┴───────┐                          │
+│  │ 堆内存(malloc)│ 小 malloc 用 brk        │
+│  │ 全部范围      │ ← 不在 mmap 范围内     │
+│  └──────────────┘                          │
+└─────────────────────────────────────────┘
+```
+
+### 7.3 为什么不能把两个值相加
+
+大块 malloc（glibc 内部用 mmap）在两个卡片**各记一次**：
+
+```
+用户代码: ptr = malloc(1MB)
+  → malloc uprobe 触发 → 堆内存(malloc) +1MB
+  → glibc 内部 mmap(1MB) → mmap uprobe 触发 → 映射内存(mmap) +1MB
+  → 同一块 1MB 内存，两个卡片各记一次
+
+堆内存(malloc): 0.3 MB
+映射内存(mmap): 1099 MB
+相加 = 1099.3 MB ← 没意义（大 malloc 部分重复计了）
+```
+
+**两个值各自独立看趋势**，不合并。
+
+### 7.4 泄露检测使用方法
+
+| 场景 | 看哪个卡片 | 栈归因 |
+|---|---|---|
+| C++ `new` 不 `delete` → 堆泄露 | **堆内存(malloc)** 增长 | 栈指向用户代码 ✅ |
+| `mmap` 不 `munmap` → 映射泄露 | **映射内存(mmap)** 增长 | 栈指向用户代码 ✅ |
+| 大块 `malloc` 不 `free` → 堆泄露 | 两个都增长（重叠） | 看**堆内存(malloc)**（栈指向用户代码），mmap 栈指向 glibc 内部 |
+| 线程/arena 泄露 | 只有**映射内存(mmap)**增长 | 栈指向 glibc/pthread 内部 |
+
+### 7.5 映射内存(mmap) 值 vs VmRSS 的差异
+
+| 指标 | 测什么 | 值 | 为什么不同 |
+|---|---|---|---|
+| 映射内存(mmap) | mmap 虚拟分配 - munmap 释放 | ~1099 MB | 含 demand-paged 未访问页（glibc arena 每线程 64MB 但大部分未访问） |
+| VmRSS（top 显示的） | 物理驻留页（实际访问过的页） | ~52 MB | 只含已 page-in 的物理页 |
+| VmSize | 全部虚拟内存 | ~1170 MB | = 匿名 mmap + 文件映射 + 其他 |
+
+**1099 MB > 52 MB 是正常的**——mmap 追踪的是虚拟分配量（OS 级），VmRSS 是物理使用量。glibc 每个线程分配 64MB arena（通过 mmap），但大部分页从未访问 → 在 mmap outstanding 中但不在 VmRSS 中。
+
+**对泄露检测**：关注 mmap 值的**趋势**（增长 = 泄露），不关注绝对值（基线高是正常的虚拟分配）。
+
+### 7.6 munmap/mremap 用 tracepoint 而非 uprobe 的原因
+
+**问题**：glibc 的 `free()` 对大块分配调用 `INLINE_SYSCALL(munmap)` —— 这是内联 syscall 指令，直接在 `free()` 函数内部执行，**不经过 libc 的 `munmap` 函数**。uprobe 挂在 libc `munmap` 函数上 → glibc 内部 munmap 调用绕过了 uprobe → munmap free = 0 → mmap outstanding 虚高。
+
+**修复**：将 `trace_munmap_entry` 和 `trace_mremap_entry` 从 `SEC("uprobe")`（挂在 libc 函数上）改为 `SEC("tracepoint/syscalls/sys_enter_munmap")`（挂在内核 syscall 入口）。tracepoint 在内核 syscall 入口触发，无论调用方是用户代码还是 glibc 内部 INLINE_SYSCALL，都会被捕获。
+
+| | uprobe（改前） | tracepoint（改后） |
+|---|---|---|
+| 用户代码调 `munmap()` | ✅ | ✅ |
+| glibc `free()` 内联 `INLINE_SYSCALL(munmap)` | ❌ 漏 | ✅ |
+
+mmap 的 uprobe 保留不变——glibc 的 `malloc` 调用 libc `mmap` 函数（非内联 syscall），uprobe 能抓到。
+
+### 7.7 已知局限
+
+| 项 | 说明 |
+|---|---|
+| 大 malloc 在两个卡片重复 | glibc 对 >128KB 的 malloc 内部用 mmap → 两个卡片都记。不影响泄露检测（各自看趋势） |
+| mmap 栈可能指向 glibc 内部 | 大 malloc 的 mmap 调用来自 glibc 内部 → 栈指向 libc 代码而非用户代码。直接 mmap 的栈指向用户代码 |
+| mmap 值含 demand-paged 页 | 高于 VmRSS 是正常的（虚拟 vs 物理） |
+| 非 anonymous mmap 已过滤 | `trace_mmap_entry` 检查 `flags & MAP_ANONYMOUS`，只追踪匿名映射（排除文件映射如 .so 加载） |
+| mremap entry-only | 不检查 mremap 返回值（失败时 delta 误计，罕见，OLS 趋势自修正） |
