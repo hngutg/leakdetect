@@ -227,10 +227,6 @@ const app = createApp({
             LeakDetectAPI.onConnect = function() { connected.value = true; };
             LeakDetectAPI.onDisconnect = function() { connected.value = false; };
             LeakDetectAPI.init();
-
-            for (var i = 0; i < resourceOrder.length; i++) {
-                loadHistory(resourceOrder[i], "1d");
-            }
         });
 
         return {

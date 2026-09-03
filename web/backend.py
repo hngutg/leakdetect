@@ -97,14 +97,13 @@ class Backend:
             time.sleep(1)
 
     def _dead_pid_cleaner_loop(self):
-        """每 60s 清理 allocs/fd_file_map 中已退出进程的条目。"""
+        """每 60s 清理 allocs 中已退出进程的条目。"""
         while True:
             try:
                 n1 = self.loader.clean_dead_pid_allocs()
-                n2 = self.loader.clean_dead_pid_fd_file_map()
                 n3 = self.loader.clean_dead_tid_mmap_entry_info()
-                if n1 + n2 + n3 > 0:
-                    print("[backend] cleaned %d allocs + %d fd_file_map + %d mmap_entry dead entries" % (n1, n2, n3))
+                if n1 + n3 > 0:
+                    print("[backend] cleaned %d allocs + %d mmap_entry dead entries" % (n1, n3))
             except Exception as e:
                 print("[backend] dead pid cleaner error: %s" % e)
             time.sleep(60)

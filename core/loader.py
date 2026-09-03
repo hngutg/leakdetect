@@ -133,15 +133,6 @@ class AllocsVal(ctypes.Structure):
     ]
 
 
-class FdFileVal(ctypes.Structure):
-    _fields_ = [
-        ("opener_pid", ctypes.c_uint32),
-        ("fd", ctypes.c_int32),
-        ("stack_cnt", ctypes.c_int),
-        ("stack_addrs", ctypes.c_ulonglong * STACK_MAX),
-    ]
-
-
 class MmapFreeKey(ctypes.Structure):
     _fields_ = [("pid", ctypes.c_ulonglong)]
 
@@ -415,10 +406,11 @@ class BpfLoader:
         print("[loader] threads tracepoints attached")
 
     def load_fd(self):
-        """加载句柄 BPF 程序（fd_install + fput kprobe）。"""
+        """加载句柄 BPF 程序（fd_install + file_close_fd + filp_close kprobe）。"""
         self._load_obj("fd", "fd.o")
         self._attach_kprobe("fd", "trace_fd_install", "fd_install")
-        self._attach_kprobe("fd", "trace_fput", "fput")
+        self._attach_kprobe("fd", "trace_file_close_fd", "file_close_fd")
+        self._attach_kprobe("fd", "trace_filp_close", "filp_close")
         print("[loader] fd kprobes attached")
 
     def start_event_loop(self, callbacks):
@@ -562,28 +554,6 @@ class BpfLoader:
                     dk = AllocsKey()
                     ctypes.memmove(ctypes.byref(dk), ctypes.byref(key), ctypes.sizeof(AllocsKey))
                     dead_keys.append(dk)
-            ret = libbpf.bpf_map_get_next_key(fd, ctypes.byref(key), ctypes.byref(next_key))
-        for dk in dead_keys:
-            libbpf.bpf_map_delete_elem(fd, ctypes.byref(dk))
-        return len(dead_keys)
-
-    def clean_dead_pid_fd_file_map(self):
-        """清理 fd_file_map 中 opener 已退出的条目。"""
-        fd = self._get_map_fd("fd", b"fd_file_map")
-        if fd < 0:
-            return 0
-        key = ctypes.c_ulonglong(0)
-        next_key = ctypes.c_ulonglong(0)
-        val = FdFileVal()
-        dead_keys = []
-        ret = libbpf.bpf_map_get_next_key(fd, None, ctypes.byref(next_key))
-        while ret == 0:
-            ctypes.memmove(ctypes.byref(key), ctypes.byref(next_key), ctypes.sizeof(ctypes.c_ulonglong))
-            r = libbpf.bpf_map_lookup_elem(fd, ctypes.byref(key), ctypes.byref(val))
-            if r == 0:
-                pid = int(val.opener_pid)
-                if pid > 0 and not os.path.exists("/proc/%d" % pid):
-                    dead_keys.append(ctypes.c_ulonglong(int(key.value)))
             ret = libbpf.bpf_map_get_next_key(fd, ctypes.byref(key), ctypes.byref(next_key))
         for dk in dead_keys:
             libbpf.bpf_map_delete_elem(fd, ctypes.byref(dk))

@@ -10,7 +10,6 @@
 #include <linux/ptrace.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
-#include <bpf/bpf_core_read.h>
 
 typedef __u32 u32;
 typedef __u64 u64;
@@ -79,14 +78,6 @@ struct fd_key_t {
 /* fd_map 的 value：引用计数 + 栈地址 */
 struct fd_value_t {
     u64 refcount;
-    int stack_cnt;
-    u64 stack_addrs[STACK_MAX_FRAMES];
-};
-
-/* fd_file_map 的 value：file 指针追踪（全局 key，跨进程） */
-struct fd_file_val_t {
-    u32 opener_pid;
-    int fd;
     int stack_cnt;
     u64 stack_addrs[STACK_MAX_FRAMES];
 };
