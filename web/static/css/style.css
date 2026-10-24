@@ -779,3 +779,153 @@ body {
         grid-template-columns: 1fr;
     }
 }
+
+/* ========== 容器概览条 ========== */
+.container-overview-strip {
+    display: flex;
+    gap: 10px;
+    overflow-x: auto;
+    padding: 8px 0 12px 0;
+    margin-bottom: 4px;
+}
+
+.container-card {
+    flex: 0 0 auto;
+    width: 140px;
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 8px;
+    padding: 10px;
+    cursor: pointer;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    user-select: none;
+}
+
+.container-card:hover {
+    border-color: #4fc3f7;
+}
+
+.container-card.selected {
+    border-color: #4fc3f7;
+    box-shadow: 0 0 8px rgba(79, 195, 247, 0.3);
+}
+
+.container-card.confirmed {
+    border-color: #f44336;
+}
+
+.container-card.suspected {
+    border-color: #ff9800;
+}
+
+.container-card.confirmed.selected {
+    box-shadow: 0 0 8px rgba(244, 67, 54, 0.3);
+}
+
+.container-card.suspected.selected {
+    box-shadow: 0 0 8px rgba(255, 152, 0, 0.3);
+}
+
+.container-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+}
+
+.container-name {
+    font-size: 12px;
+    font-weight: 600;
+    color: #e0e0e0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 85px;
+}
+
+.container-sev-badge {
+    font-size: 10px;
+    font-weight: 700;
+}
+
+.container-mem {
+    font-size: 13px;
+    color: #4fc3f7;
+    margin-bottom: 2px;
+}
+
+.container-pid-count {
+    font-size: 10px;
+    color: #6b7280;
+    margin-top: 2px;
+}
+
+/* 容器卡片内资源块（每资源：标签行 + sparkline） */
+.container-resource-block {
+    margin-top: 3px;
+}
+
+.container-resource-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 11px;
+    margin-bottom: 1px;
+}
+
+.container-resource-label {
+    color: #6b7280;
+}
+
+.container-resource-value {
+    color: #e0e0e0;
+    font-weight: 600;
+}
+
+/* ========== Sparkline ========== */
+.sparkline-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.sparkline-svg {
+    display: block;
+}
+
+.sparkline-caption {
+    font-size: 10px;
+    color: #6b7280;
+    text-align: center;
+    margin-top: 2px;
+}
+
+/* ========== 容器徽章（进程表 + 告警） ========== */
+.container-badge {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 600;
+    color: #81c784;
+    background: rgba(129, 199, 132, 0.12);
+    border: 1px solid rgba(129, 199, 132, 0.3);
+    border-radius: 3px;
+    padding: 1px 4px;
+    margin: 0 3px;
+    vertical-align: middle;
+    white-space: nowrap;
+    max-width: 80px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* 进程表中的容器徽章更紧凑 */
+.process-table .container-badge {
+    margin: 0 2px;
+}
+
+/* 告警中的容器徽章 */
+.alert-item .container-badge {
+    color: #ce93d8;
+    background: rgba(206, 147, 216, 0.12);
+    border-color: rgba(206, 147, 216, 0.3);
+}

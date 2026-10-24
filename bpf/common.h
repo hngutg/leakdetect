@@ -13,6 +13,7 @@
 
 typedef __u32 u32;
 typedef __u64 u64;
+typedef __u8 u8;
 typedef __s32 s32;
 typedef __s64 s64;
 
@@ -109,6 +110,10 @@ struct mmap_entry_info_t {
 /* mmap_free_map key/value（per-PID munmap 聚合） */
 struct mmap_free_key_t { u64 pid; };
 struct mmap_free_val_t { u64 free_bytes; };
+
+/* mmap 地址→栈反查（munmap 时按地址匹配到原始 mmap 的栈）*/
+struct mmap_addr_key_t { u64 pid; u64 addr; };
+struct mmap_addr_val_t { u64 stack_addrs[STACK_MAX_FRAMES]; };
 
 /* [RSP] 补帧内联函数（malloc/mmap/mremap 共用） */
 static __always_inline void fixup_return_addr(struct pt_regs *ctx,

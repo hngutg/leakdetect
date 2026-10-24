@@ -39,7 +39,7 @@ const app = createApp({
         const currentView = ref("dashboard");
 
         // F4: 容器选择 + PID 输入
-        const selectedContainer = ref(null);
+        const selectedContainer = ref("all");
         const pidInput = ref("");
         const activePidFilter = ref(null);
 
@@ -48,6 +48,10 @@ const app = createApp({
             mem: [], mmap: [], thread: [], fd: [], cpu: []
         });
         const rawAlerts = ref([]);
+
+        // 容器概览：summary 来自契约，trends 前端实时累积（cap 600 = 10min@1s）
+        const containerSummary = ref([]);
+        const containerTrends = reactive({});
 
         // F4: computed 前端过滤
         const filteredPerProcess = computed(function() {
@@ -95,10 +99,27 @@ const app = createApp({
 
         // F2: 加载历史数据
         async function loadHistory(resource, range) {
+            var cid = selectedContainer.value;
             chartData[resource].loading = true;
             try {
-                var resp = await LeakDetectAPI.getHistory(resource, range);
-                chartData[resource].series = resp.series || [];
+                var resp = await LeakDetectAPI.getHistory(resource, range, cid);
+                if (selectedContainer.value === cid) {
+                    var dbSeries = resp.series || [];
+                    // 合并：DB 长期历史（60s）+ containerTrends 近期波形（1s，10min）
+                    if (cid !== "all") {
+                        var trends = containerTrends[String(cid)] || [];
+                        if (trends.length > 0) {
+                            var trendSeries = trends.map(function(p) { return {t: p.t, v: p[resource]}; });
+                            var trendStart = trendSeries[0].t;
+                            var oldDb = dbSeries.filter(function(p) { return p.t < trendStart; });
+                            chartData[resource].series = oldDb.concat(trendSeries);
+                        } else {
+                            chartData[resource].series = dbSeries;
+                        }
+                    } else {
+                        chartData[resource].series = dbSeries;
+                    }
+                }
             } catch (e) {
                 console.error("[history] load " + resource + " failed:", e);
             }
@@ -121,34 +142,59 @@ const app = createApp({
         }
 
         function handleDashboardUpdate(data) {
-            if (data.latest_points) {
-                resources.mem.current = data.latest_points.mem.v;
-                resources.mmap.current = data.latest_points.mmap.v;
-                resources.thread.current = data.latest_points.thread.v;
-                resources.fd.current = data.latest_points.fd.v;
-                resources.cpu.current = data.latest_points.cpu.v;
+            // 容器一致性检查：只处理与当前选中容器匹配的推送（防止切换后旧容器推送残留）
+            var pushCid = data.filter ? data.filter.container_id : undefined;
+            if (pushCid === selectedContainer.value) {
+                if (data.latest_points) {
+                    resources.mem.current = data.latest_points.mem.v;
+                    resources.mmap.current = data.latest_points.mmap.v;
+                    resources.thread.current = data.latest_points.thread.v;
+                    resources.fd.current = data.latest_points.fd.v;
+                    resources.cpu.current = data.latest_points.cpu.v;
 
-                for (var i = 0; i < resourceOrder.length; i++) {
-                    var r = resourceOrder[i];
-                    if (data.latest_points[r]) {
-                        appendPoint(r, data.latest_points[r]);
+                    for (var i = 0; i < resourceOrder.length; i++) {
+                        var r = resourceOrder[i];
+                        if (data.latest_points[r]) {
+                            appendPoint(r, data.latest_points[r]);
+                        }
                     }
                 }
+
+                // F4: 存原始 per_process
+                if (data.per_process) {
+                    rawPerProcess.mem = data.per_process.mem || [];
+                    rawPerProcess.mmap = data.per_process.mmap || [];
+                    rawPerProcess.thread = data.per_process.thread || [];
+                    rawPerProcess.fd = data.per_process.fd || [];
+                    rawPerProcess.cpu = data.per_process.cpu || [];
+                }
+
+                // F4: 存原始告警
+                rawAlerts.value = data.alerts || [];
             }
 
-            // F4: 存原始 per_process
-            if (data.per_process) {
-                rawPerProcess.mem = data.per_process.mem || [];
-                rawPerProcess.mmap = data.per_process.mmap || [];
-                rawPerProcess.thread = data.per_process.thread || [];
-                rawPerProcess.fd = data.per_process.fd || [];
-                rawPerProcess.cpu = data.per_process.cpu || [];
-            }
-
-            // F4: 存原始告警
-            rawAlerts.value = data.alerts || [];
-
+            // 以下始终更新（全局数据，不依赖 display_target）
             containers.value = data.containers || [];
+
+            // 容器概览：更新 summary + 累积每容器 mem 趋势（cap 600 = 10min@1s）
+            if (data.container_summary) {
+                containerSummary.value = data.container_summary;
+                var now = data.timestamp;
+                var liveKeys = {};
+                data.container_summary.forEach(function(c) {
+                    var key = String(c.id);
+                    liveKeys[key] = true;
+                    var arr = containerTrends[key] || [];
+                    var newArr = arr.slice();
+                    newArr.push({ t: now, mem: c.mem, mmap: c.mmap, thread: c.thread, fd: c.fd, cpu: c.cpu });
+                    if (newArr.length > 600) newArr.shift();
+                    containerTrends[key] = newArr;
+                });
+                Object.keys(containerTrends).forEach(function(k) {
+                    if (!liveKeys[k]) delete containerTrends[k];
+                });
+            }
+
             lastUpdate.value = new Date().toLocaleTimeString();
         }
 
@@ -206,6 +252,25 @@ const app = createApp({
         // F4: 容器切换
         function onContainerChange() {
             LeakDetectAPI.selectContainer(selectedContainer.value);
+            clearChartData();
+            if (selectedContainer.value !== "all") {
+                loadContainerTrends(selectedContainer.value);
+            }
+        }
+
+        // 概览条点击：toggle 下钻（点已选中卡 → 回"全部"）
+        function onOverviewSelect(cid) {
+            if (selectedContainer.value === cid) {
+                selectedContainer.value = "all";
+                LeakDetectAPI.selectContainer("all");
+            } else {
+                selectedContainer.value = cid;
+                LeakDetectAPI.selectContainer(cid);
+            }
+            clearChartData();
+            if (selectedContainer.value !== "all") {
+                loadContainerTrends(selectedContainer.value);
+            }
         }
 
         // F4: PID 应用
@@ -216,10 +281,33 @@ const app = createApp({
 
         // F4: 清除所有过滤
         function clearFilters() {
-            selectedContainer.value = null;
+            selectedContainer.value = "all";
             pidInput.value = "";
             activePidFilter.value = null;
-            LeakDetectAPI.selectContainer(null);
+            LeakDetectAPI.selectContainer("all");
+            clearChartData();
+        }
+
+        function clearChartData() {
+            for (var i = 0; i < resourceOrder.length; i++) {
+                chartData[resourceOrder[i]].series = [];
+            }
+        }
+
+        function reloadAllHistory() {
+            for (var i = 0; i < resourceOrder.length; i++) {
+                var r = resourceOrder[i];
+                loadHistory(r, chartData[r].range);
+            }
+        }
+
+        function loadContainerTrends(cid) {
+            var key = String(cid);
+            var trends = containerTrends[key] || [];
+            for (var i = 0; i < resourceOrder.length; i++) {
+                var r = resourceOrder[i];
+                chartData[r].series = trends.map(function(p) { return {t: p.t, v: p[r]}; });
+            }
         }
 
         onMounted(function() {
@@ -237,6 +325,7 @@ const app = createApp({
             currentView, showConfig, showMonitoringConfig, showDashboard,
             selectedContainer, pidInput, activePidFilter,
             rawPerProcess, rawAlerts,
+            containerSummary, containerTrends, onOverviewSelect,
             filteredPerProcess, filteredAlerts, suspectedAlerts, confirmedAlerts,
             onContainerChange, applyPidFilter, clearFilters,
             formatValue, statusText, resourceLabel, formatTime,
@@ -246,6 +335,8 @@ const app = createApp({
 
 app.component('LineChart', LineChart);
 app.component('StackView', StackView);
+app.component('Sparkline', Sparkline);
+app.component('ContainerOverview', ContainerOverview);
 app.component('ConfigPage', ConfigPage);
 app.component('MonitoringConfigPage', MonitoringConfigPage);
 

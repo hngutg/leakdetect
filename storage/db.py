@@ -57,19 +57,47 @@ class Database:
             )
             self.conn.commit()
 
-    def query_history(self, resource, range_tag):
-        """查询历史时序数据（REST /api/history 调用）。"""
+    def query_history(self, resource, range_tag, container_id=None):
+        """查询历史时序数据（REST /api/history 调用）。
+        container_id: None/"all"=全局聚合, "host"=宿主机, cid=特定容器。"""
         ranges = {"1d": 86400, "7d": 604800, "30d": 2592000}
         duration = ranges.get(range_tag, 86400)
         cutoff = int(time.time()) - duration
         with self._lock:
-            cur = self.conn.execute(
-                "SELECT timestamp, value FROM samples "
-                "WHERE resource=? AND timestamp>=? ORDER BY timestamp",
-                (resource, cutoff)
-            )
+            if container_id is None or container_id == "all":
+                cur = self.conn.execute(
+                    "SELECT timestamp, SUM(value) FROM samples "
+                    "WHERE resource=? AND timestamp>=? AND pid IS NULL "
+                    "GROUP BY timestamp ORDER BY timestamp",
+                    (resource, cutoff)
+                )
+            elif container_id == "host":
+                cur = self.conn.execute(
+                    "SELECT timestamp, value FROM samples "
+                    "WHERE resource=? AND timestamp>=? AND pid IS NULL AND container_id IS NULL "
+                    "ORDER BY timestamp",
+                    (resource, cutoff)
+                )
+            else:
+                cur = self.conn.execute(
+                    "SELECT timestamp, value FROM samples "
+                    "WHERE resource=? AND timestamp>=? AND pid IS NULL AND container_id=? "
+                    "ORDER BY timestamp",
+                    (resource, cutoff, container_id)
+                )
             series = [{"t": row[0], "v": row[1]} for row in cur.fetchall()]
         return {"range": range_tag, "series": series}
+
+    def cleanup_old_samples(self, retention_days=30):
+        """删除超过保留期的旧采样和告警数据。"""
+        cutoff = int(time.time()) - retention_days * 86400
+        with self._lock:
+            cur = self.conn.execute("DELETE FROM samples WHERE timestamp < ?", (cutoff,))
+            n = cur.rowcount
+            cur = self.conn.execute("DELETE FROM alerts WHERE timestamp < ?", (cutoff,))
+            n += cur.rowcount
+            self.conn.commit()
+        return n
 
     def query_alerts(self, range_tag):
         """查询历史告警（REST /api/alerts 调用）。"""

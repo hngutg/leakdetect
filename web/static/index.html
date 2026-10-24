@@ -13,6 +13,7 @@
             <h1>LeakDetect</h1>
             <div class="filter-controls" v-if="currentView === 'dashboard'">
                 <select v-model="selectedContainer" @change="onContainerChange" class="filter-select">
+                    <option value="all">全部</option>
                     <option :value="null">宿主机</option>
                     <option v-for="c in containers" :key="c.id" :value="c.id">{{ c.name + (c.id_short ? ' (' + c.id_short + ')' : '') }}</option>
                 </select>
@@ -32,6 +33,14 @@
 
         <!-- Dashboard 视图 -->
         <div v-if="currentView === 'dashboard'">
+            <!-- 容器概览条 -->
+            <container-overview
+                :summary="containerSummary"
+                :trend-data="containerTrends"
+                :selected="selectedContainer"
+                @select="onOverviewSelect">
+            </container-overview>
+
             <!-- 告警区（全宽，置顶） -->
             <div class="alert-section">
                 <div class="alert-list">
@@ -56,6 +65,7 @@
                             <span class="alert-type">{{ resourceLabel(a.resource) }}泄露</span>
                             <span class="alert-pid">PID:{{ a.pid }}</span>
                             <span class="alert-name" :title="a.process_name">{{ a.process_name }}</span>
+                            <span class="container-badge" v-if="a.container_name">{{ a.container_name }}</span>
                             <div class="alert-detail">{{ a.detail }}</div>
                             <div class="alert-time">{{ formatTime(a.timestamp) }}</div>
                             <stack-view v-if="selectedAlert && selectedAlert.id === a.id" :alert="a"></stack-view>
@@ -71,6 +81,7 @@
                             <span class="alert-type">{{ resourceLabel(a.resource) }}泄露</span>
                             <span class="alert-pid">PID:{{ a.pid }}</span>
                             <span class="alert-name" :title="a.process_name">{{ a.process_name }}</span>
+                            <span class="container-badge" v-if="a.container_name">{{ a.container_name }}</span>
                             <div class="alert-detail">{{ a.detail }}</div>
                             <div class="alert-time">{{ formatTime(a.timestamp) }}</div>
                             <stack-view v-if="selectedAlert && selectedAlert.id === a.id" :alert="a"></stack-view>
@@ -87,6 +98,7 @@
                             <span class="alert-type">{{ resourceLabel(a.resource) }}泄露</span>
                             <span class="alert-pid">PID:{{ a.pid }}</span>
                             <span class="alert-name" :title="a.process_name">{{ a.process_name }}</span>
+                            <span class="container-badge" v-if="a.container_name">{{ a.container_name }}</span>
                             <div class="alert-detail">{{ a.detail }}</div>
                             <div class="alert-time">{{ formatTime(a.timestamp) }}</div>
                             <stack-view v-if="selectedAlert && selectedAlert.id === a.id" :alert="a"></stack-view>
@@ -116,7 +128,7 @@
                     </line-chart>
                     <table class="process-table" v-if="filteredPerProcess[r].length">
                         <tr v-for="p in filteredPerProcess[r]" :key="p.pid">
-                            <td><span class="proc-pid">{{ p.pid }}</span><span class="proc-name" :title="p.name">{{ p.name }}</span></td>
+                            <td><span class="proc-pid">{{ p.pid }}</span><span class="container-badge" v-if="p.container_name">{{ p.container_name }}</span><span class="proc-name" :title="p.name">{{ p.name }}</span></td>
                             <td>{{ formatValue(r, p.value) }}</td>
                             <td v-if="p.delta_60s">{{ formatValue(r, p.delta_60s) }}/60s</td>
                             <td v-else></td>
@@ -145,6 +157,8 @@
     <!-- 组件 -->
     <script src="/static/js/components/line-chart.js"></script>
     <script src="/static/js/components/stack-view.js"></script>
+    <script src="/static/js/components/sparkline.js"></script>
+    <script src="/static/js/components/container-overview.js"></script>
     <script src="/static/js/components/filter-config.js"></script>
     <script src="/static/js/components/monitoring-config.js"></script>
     <!-- 应用代码 -->

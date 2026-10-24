@@ -48,7 +48,7 @@ class Backend:
         self.cpu_monitor = CpuMonitor(config["sampling"]["cpu_interval"])
         self.cpu_stats = []
         self.cgroup_enum = CgroupEnum(refresh_interval=30)
-        self.display_target = None
+        self.display_target = "all"
         self._started = False
 
     def start(self):
@@ -76,13 +76,14 @@ class Backend:
         threading.Thread(target=self._cpu_loop, daemon=True).start()
         threading.Thread(target=self._sampler_loop, daemon=True).start()
         threading.Thread(target=self._dead_pid_cleaner_loop, daemon=True).start()
+        threading.Thread(target=self._retention_loop, daemon=True).start()
 
         self.cgroup_enum.start()
         self._started = True
         print("[backend] All components started.")
 
     def set_display_target(self, cid):
-        """设置显示过滤目标：None=宿主 / cid=容器（仅影响显示，不影响采集存储）。"""
+        """设置显示过滤目标："all"=全部 / None=宿主 / cid=容器（仅影响显示，不影响采集存储）。"""
         self.display_target = cid
 
     def _map_reader_loop(self):
@@ -97,13 +98,15 @@ class Backend:
             time.sleep(1)
 
     def _dead_pid_cleaner_loop(self):
-        """每 60s 清理 allocs 中已退出进程的条目。"""
+        """每 60s 清理 allocs/mmap_addr_map/python_pids 中已退出进程的条目。"""
         while True:
             try:
                 n1 = self.loader.clean_dead_pid_allocs()
                 n3 = self.loader.clean_dead_tid_mmap_entry_info()
-                if n1 + n3 > 0:
-                    print("[backend] cleaned %d allocs + %d mmap_entry dead entries" % (n1, n3))
+                n4 = self.loader.clean_dead_pid_mmap_addr_map()
+                n5 = self.loader.clean_dead_pid_python_pids()
+                if n1 + n3 + n4 + n5 > 0:
+                    print("[backend] cleaned %d allocs + %d mmap_entry + %d mmap_addr + %d python_pids dead entries" % (n1, n3, n4, n5))
             except Exception as e:
                 print("[backend] dead pid cleaner error: %s" % e)
             time.sleep(60)
@@ -138,26 +141,66 @@ class Backend:
             time.sleep(1)
 
     def _sampler_loop(self):
+        """每 60s 写 per-container 聚合采样到 DB。"""
         while True:
             try:
-                for p in self.aggregator.get_per_process_mem()[:5]:
-                    self.db.write_sample("mem", p["pid"], p["value"])
-                for p in self.aggregator.get_per_process_mmap()[:5]:
-                    self.db.write_sample("mmap", p["pid"], p["value"])
-                for p in self.aggregator.get_per_process_thread()[:5]:
-                    self.db.write_sample("thread", p["pid"], p["value"])
-                for p in self.aggregator.get_per_process_fd()[:5]:
-                    self.db.write_sample("fd", p["pid"], p["value"])
-                for p in self.cpu_stats[:5]:
-                    self.db.write_sample("cpu", p["pid"], p["value"])
+                self._write_container_samples()
             except Exception as e:
                 print("[backend] sampler error: %s" % e)
             time.sleep(60)
 
+    def _write_container_samples(self):
+        """按容器聚合各资源，写入 DB（pid=NULL, container_id=cid）。"""
+        mem_all = self.aggregator.get_per_process_mem()
+        mmap_all = self.aggregator.get_per_process_mmap()
+        thr_all = self.aggregator.get_per_process_thread()
+        fd_all = self.aggregator.get_per_process_fd()
+        cpu_all = self.cpu_stats
+        csum = {}
+        for cid, name, pc in self.cgroup_enum.summary_pid_counts():
+            csum[cid] = {"mem": 0, "mmap": 0, "thread": 0, "fd": 0, "cpu": 0}
+        for p in mem_all:
+            cid, _ = self.cgroup_enum.pid_container(p["pid"])
+            if cid in csum:
+                csum[cid]["mem"] += p["value"]
+        for p in mmap_all:
+            cid, _ = self.cgroup_enum.pid_container(p["pid"])
+            if cid in csum:
+                csum[cid]["mmap"] += p["value"]
+        for p in thr_all:
+            cid, _ = self.cgroup_enum.pid_container(p["pid"])
+            if cid in csum:
+                csum[cid]["thread"] += p["value"]
+        for p in fd_all:
+            cid, _ = self.cgroup_enum.pid_container(p["pid"])
+            if cid in csum:
+                csum[cid]["fd"] += p["value"]
+        for p in cpu_all:
+            cid, _ = self.cgroup_enum.pid_container(p["pid"])
+            if cid in csum:
+                csum[cid]["cpu"] += p["value"]
+        for cid, vals in csum.items():
+            self.db.write_sample("mem", None, vals["mem"], container_id=cid)
+            self.db.write_sample("mmap", None, vals["mmap"], container_id=cid)
+            self.db.write_sample("thread", None, vals["thread"], container_id=cid)
+            self.db.write_sample("fd", None, vals["fd"], container_id=cid)
+            self.db.write_sample("cpu", None, vals["cpu"], container_id=cid)
+
+    def _retention_loop(self):
+        """每小时清理超过保留期的旧 DB 数据。"""
+        while True:
+            try:
+                n = self.db.cleanup_old_samples(30)
+                if n > 0:
+                    print("[backend] purged %d old samples/alerts" % n)
+            except Exception as e:
+                print("[backend] retention error: %s" % e)
+            time.sleep(3600)
+
     def get_dashboard_update(self):
         now = int(time.time())
         tpids = self.cgroup_enum.target_pids(self.display_target)
-        if self.display_target is not None and not tpids:
+        if self.display_target is not None and self.display_target != "all" and not tpids:
             print("[backend] target %s not found (stopped?), showing empty" % self.display_target)
         mem_all = self.aggregator.get_per_process_mem()
         mmap_all = self.aggregator.get_per_process_mmap()
@@ -165,17 +208,32 @@ class Backend:
         fd_all = self.aggregator.get_per_process_fd()
         cpu_all = self.cpu_stats
 
-        def _top5(pp):
+        _is_all = self.display_target == "all"
+        _limit = 10 if _is_all else 5
+
+        def _top_n(pp, limit):
             f = [p for p in pp if p["pid"] in tpids]
-            result = sorted(f, key=lambda x: x["value"], reverse=True)[:5]
+            result = sorted(f, key=lambda x: x["value"], reverse=True)[:limit]
             for p in result:
                 p["name"] = self.cgroup_enum.pid_cmdline(p["pid"]) or p["name"]
+                cid, cname = self.cgroup_enum.pid_container(p["pid"])
+                p["container_id"] = cid
+                p["container_name"] = cname
             return result
 
-        alerts = [a for a in (self.analyzer_mem.get_active_alerts()
-                  + self.analyzer_mmap.get_active_alerts()
-                  + self.analyzer_threads.get_active_alerts()
-                  + self.analyzer_fd.get_active_alerts()) if a["pid"] in tpids]
+        all_alerts = (self.analyzer_mem.get_active_alerts()
+                      + self.analyzer_mmap.get_active_alerts()
+                      + self.analyzer_threads.get_active_alerts()
+                      + self.analyzer_fd.get_active_alerts())
+        alerts = []
+        for a in all_alerts:
+            if a["pid"] not in tpids:
+                continue
+            cid, cname = self.cgroup_enum.pid_container(a["pid"])
+            a["container_id"] = cid
+            a["container_name"] = cname
+            alerts.append(a)
+
         _mem = sum(p["value"] for p in mem_all if p["pid"] in tpids)
         _mmap = sum(p["value"] for p in mmap_all if p["pid"] in tpids)
         _thread = sum(p["value"] for p in thr_all if p["pid"] in tpids)
@@ -183,6 +241,43 @@ class Backend:
         _cpu = sum(p["value"] for p in cpu_all if p["pid"] in tpids)
         print("[debug] target=%s mem=%d mmap=%d thread=%d fd=%d cpu=%d" % (
             self.display_target or "host", _mem, _mmap, _thread, _fd, _cpu))
+
+        # 容器概览聚合（全局，不受 display_target 过滤影响）
+        def _sev_rank(s):
+            return {"confirmed": 3, "suspected": 2}.get(s, 0)
+        csum = {}
+        for cid, name, pc in self.cgroup_enum.summary_pid_counts():
+            csum[cid] = {"id": cid, "name": name, "mem": 0, "mmap": 0,
+                         "thread": 0, "fd": 0, "cpu": 0,
+                         "pid_count": pc, "sev": "normal"}
+        for p in mem_all:
+            cid, _ = self.cgroup_enum.pid_container(p["pid"])
+            if cid in csum:
+                csum[cid]["mem"] += p["value"]
+        for p in mmap_all:
+            cid, _ = self.cgroup_enum.pid_container(p["pid"])
+            if cid in csum:
+                csum[cid]["mmap"] += p["value"]
+        for p in thr_all:
+            cid, _ = self.cgroup_enum.pid_container(p["pid"])
+            if cid in csum:
+                csum[cid]["thread"] += p["value"]
+        for p in fd_all:
+            cid, _ = self.cgroup_enum.pid_container(p["pid"])
+            if cid in csum:
+                csum[cid]["fd"] += p["value"]
+        for p in cpu_all:
+            cid, _ = self.cgroup_enum.pid_container(p["pid"])
+            if cid in csum:
+                csum[cid]["cpu"] += p["value"]
+        for a in all_alerts:
+            cid, _ = self.cgroup_enum.pid_container(a["pid"])
+            if cid in csum and _sev_rank(a["severity"]) > _sev_rank(csum[cid]["sev"]):
+                csum[cid]["sev"] = a["severity"]
+        _sev_order = {"confirmed": 0, "suspected": 1, "normal": 2, "resolved": 3}
+        container_summary = sorted(csum.values(),
+                                   key=lambda x: (_sev_order.get(x["sev"], 9), -x["mem"]))
+
         return {
             "type": "dashboard_update",
             "timestamp": now,
@@ -195,18 +290,19 @@ class Backend:
                 "cpu": {"t": now, "v": _cpu},
             },
             "per_process": {
-                "mem": _top5(mem_all),
-                "mmap": _top5(mmap_all),
-                "thread": _top5(thr_all),
-                "fd": _top5(fd_all),
-                "cpu": _top5(cpu_all),
+                "mem": _top_n(mem_all, _limit),
+                "mmap": _top_n(mmap_all, _limit),
+                "thread": _top_n(thr_all, _limit),
+                "fd": _top_n(fd_all, _limit),
+                "cpu": _top_n(cpu_all, _limit),
             },
             "alerts": alerts,
             "containers": self.cgroup_enum.enumerate(),
+            "container_summary": container_summary,
         }
 
-    def get_history(self, resource, range_tag):
-        return self.db.query_history(resource, range_tag)
+    def get_history(self, resource, range_tag, container_id=None):
+        return self.db.query_history(resource, range_tag, container_id)
 
     def get_alerts(self, range_tag):
         return self.db.query_alerts(range_tag)

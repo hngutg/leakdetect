@@ -33,8 +33,14 @@ const LeakDetectAPI = {
         this.socket.emit("select_container", { container_id: containerId });
     },
 
-    async getHistory(resource, range) {
-        const resp = await fetch("/api/history?resource=" + resource + "&range=" + range);
+    async getHistory(resource, range, containerId) {
+        var url = "/api/history?resource=" + resource + "&range=" + range;
+        if (containerId === null) {
+            url += "&container_id=host";
+        } else if (containerId && containerId !== "all") {
+            url += "&container_id=" + encodeURIComponent(containerId);
+        }
+        const resp = await fetch(url);
         return resp.json();
     },
 

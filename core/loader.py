@@ -79,6 +79,11 @@ libbpf.bpf_map_lookup_elem.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_v
 libbpf.bpf_map_delete_elem.restype = ctypes.c_int
 libbpf.bpf_map_delete_elem.argtypes = [ctypes.c_int, ctypes.c_void_p]
 
+libbpf.bpf_map_update_elem.restype = ctypes.c_int
+libbpf.bpf_map_update_elem.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulonglong]
+
+BPF_ANY = 0
+
 # ring buffer 回调类型: int (*)(void *ctx, void *data, size_t size)
 # 返回 0 = 继续处理，非 0 = 停止
 RING_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
@@ -139,6 +144,19 @@ class MmapFreeKey(ctypes.Structure):
 
 class MmapFreeVal(ctypes.Structure):
     _fields_ = [("free_bytes", ctypes.c_ulonglong)]
+
+
+class MmapAddrKey(ctypes.Structure):
+    _fields_ = [
+        ("pid", ctypes.c_ulonglong),
+        ("addr", ctypes.c_ulonglong),
+    ]
+
+
+class MmapAddrVal(ctypes.Structure):
+    _fields_ = [
+        ("stack_addrs", ctypes.c_ulonglong * STACK_MAX),
+    ]
 
 
 class MmapEntryInfo(ctypes.Structure):
@@ -209,6 +227,7 @@ class BpfLoader:
         self._cb_refs = []      # 持有回调引用，防止 GC
         self._links = []        # 持有 uprobe link 指针，防 GC 导致 detach
         self._attached_libcs = set()  # 已挂载 libc 的 inode 集合 {(st_dev, st_ino)}
+        self._attached_pythons = set()  # 已挂载 libpython 的 inode 集合
         self._bpf_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "bpf", "compiled"
@@ -249,12 +268,15 @@ class BpfLoader:
         print("[loader] uprobe %s:%s attached at %s+0x%x" % (
             prog_name, sym_name, libc_path, offset))
 
-    def _attach_kprobe(self, resource, prog_name, func_name):
-        """attach kprobe。"""
+    def _attach_kprobe(self, resource, prog_name, func_name, optional=False):
+        """attach kprobe。optional=True 时失败只 warning 不 raise。"""
         prog = self._find_prog(resource, prog_name)
         link = libbpf.bpf_program__attach_kprobe(
             prog, False, func_name.encode("utf-8"))
         if not link:
+            if optional:
+                print("[loader] WARNING: kprobe %s:%s not available, skipping" % (prog_name, func_name))
+                return
             raise RuntimeError("Failed to attach kprobe %s:%s" % (prog_name, func_name))
         print("[loader] kprobe %s:%s attached" % (prog_name, func_name))
 
@@ -388,13 +410,148 @@ class BpfLoader:
             except Exception as e:
                 print("[loader] libc reenum error: %s" % e)
 
+    def _discover_all_pythons(self):
+        """扫描 /proc/[pid]/maps 发现所有唯一的 libpython（含容器，按 inode 去重）。"""
+        pythons = {}
+        for pid_s in os.listdir("/proc"):
+            if not pid_s.isdigit():
+                continue
+            pid = int(pid_s)
+            try:
+                with open("/proc/%d/maps" % pid) as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) < 6:
+                            continue
+                        path = parts[5]
+                        basename = os.path.basename(path)
+                        if not (basename.startswith("libpython") and ".so" in basename):
+                            continue
+                        access_path = "/proc/%d/root%s" % (pid, path)
+                        if not os.path.exists(access_path):
+                            continue
+                        st = os.stat(access_path)
+                        key = (st.st_dev, st.st_ino)
+                        if key not in pythons:
+                            pythons[key] = access_path
+            except (IOError, OSError):
+                continue
+        return pythons
+
+    def _attach_all_python_uprobes(self):
+        """给所有未挂载的 libpython 挂 PyObject_Malloc/Free uprobe。"""
+        pythons = self._discover_all_pythons()
+        new_count = 0
+        for inode_key, path in pythons.items():
+            if inode_key in self._attached_pythons:
+                continue
+            try:
+                off_malloc = _find_symbol_offset(path, "PyObject_Malloc")
+                off_free = _find_symbol_offset(path, "PyObject_Free")
+                probes = [
+                    ("trace_pymalloc_entry", off_malloc, False),
+                    ("trace_pymalloc_return", off_malloc, True),
+                    ("trace_pyfree_entry", off_free, False),
+                ]
+                new_links = []
+                all_ok = True
+                for prog_name, offset, retprobe in probes:
+                    prog = self._find_prog("mem", prog_name)
+                    link = libbpf.bpf_program__attach_uprobe(
+                        prog, retprobe, -1, path.encode("utf-8"), offset)
+                    if not link:
+                        print("[loader] WARNING: attach Python probe on %s failed" % path)
+                        all_ok = False
+                        break
+                    new_links.append(link)
+                if all_ok:
+                    self._links.extend(new_links)
+                    self._attached_pythons.add(inode_key)
+                    new_count += 1
+                    print("[loader] python uprobe attached: %s (PyObject_Malloc@0x%x PyObject_Free@0x%x)" % (
+                        path, off_malloc, off_free))
+            except Exception as e:
+                print("[loader] WARNING: skip python %s: %s" % (path, e))
+        if new_count:
+            print("[loader] %d new python(s) attached, total %d" % (
+                new_count, len(self._attached_pythons)))
+
+    def _update_python_pids(self):
+        """扫描 /proc/*/exe，含 python 的 PID 写入 python_pids BPF map。"""
+        fd = self._get_map_fd("mem", b"python_pids")
+        if fd < 0:
+            return
+        # 获取当前 Python PID 集合
+        current_pids = set()
+        for pid_s in os.listdir("/proc"):
+            if not pid_s.isdigit():
+                continue
+            pid = int(pid_s)
+            try:
+                exe = os.readlink("/proc/%d/exe" % pid)
+                if "python" in exe.lower():
+                    current_pids.add(pid)
+            except Exception:
+                continue
+        # 先删 stale 条目（防 PID 复用）
+        key = ctypes.c_uint32(0)
+        next_key = ctypes.c_uint32(0)
+        stale_keys = []
+        existing_pids = set()
+        ret = libbpf.bpf_map_get_next_key(fd, None, ctypes.byref(next_key))
+        while ret == 0:
+            ctypes.memmove(ctypes.byref(key), ctypes.byref(next_key), ctypes.sizeof(ctypes.c_uint32))
+            existing_pids.add(key.value)
+            if key.value not in current_pids:
+                stale_keys.append(ctypes.c_uint32(key.value))
+            ret = libbpf.bpf_map_get_next_key(fd, ctypes.byref(key), ctypes.byref(next_key))
+        for sk in stale_keys:
+            libbpf.bpf_map_delete_elem(fd, ctypes.byref(sk))
+        # 加新条目
+        one = ctypes.c_uint8(1)
+        for pid in current_pids:
+            if pid not in existing_pids:
+                key.value = pid
+                libbpf.bpf_map_update_elem(fd, ctypes.byref(key), ctypes.byref(one), BPF_ANY)
+
+    def _python_reenum_loop(self):
+        """每 60s 重新枚举 libpython + 更新 python_pids。"""
+        while True:
+            time.sleep(60)
+            try:
+                self._attach_all_python_uprobes()
+                self._update_python_pids()
+            except Exception as e:
+                print("[loader] python reenum error: %s" % e)
+
+    def clean_dead_pid_python_pids(self):
+        """清理 python_pids 中已退出进程的条目。"""
+        fd = self._get_map_fd("mem", b"python_pids")
+        if fd < 0:
+            return 0
+        key = ctypes.c_uint32(0)
+        next_key = ctypes.c_uint32(0)
+        dead_keys = []
+        ret = libbpf.bpf_map_get_next_key(fd, None, ctypes.byref(next_key))
+        while ret == 0:
+            ctypes.memmove(ctypes.byref(key), ctypes.byref(next_key), ctypes.sizeof(ctypes.c_uint32))
+            if not os.path.exists("/proc/%d" % key.value):
+                dead_keys.append(ctypes.c_uint32(key.value))
+            ret = libbpf.bpf_map_get_next_key(fd, ctypes.byref(key), ctypes.byref(next_key))
+        for dk in dead_keys:
+            libbpf.bpf_map_delete_elem(fd, ctypes.byref(dk))
+        return len(dead_keys)
+
     def load_mem(self):
-        """加载内存 BPF 程序（全 libc uprobe + mmap/munmap/mremap tracepoint）。"""
+        """加载内存 BPF 程序（libc + Python uprobe + mmap tracepoint）。"""
         self._load_obj("mem", "mem.o")
         self._attach_all_libc_uprobes()
+        self._attach_all_python_uprobes()
+        self._update_python_pids()
         self._attach_tp("mem", "trace_munmap_entry", "syscalls", "sys_enter_munmap")
         self._attach_tp("mem", "trace_mremap_entry", "syscalls", "sys_enter_mremap", optional=True)
         threading.Thread(target=self._libc_reenum_loop, daemon=True).start()
+        threading.Thread(target=self._python_reenum_loop, daemon=True).start()
         print("[loader] mem probes attached")
 
     def load_threads(self):
@@ -406,11 +563,11 @@ class BpfLoader:
         print("[loader] threads tracepoints attached")
 
     def load_fd(self):
-        """加载句柄 BPF 程序（fd_install + file_close_fd + filp_close kprobe）。"""
+        """加载句柄 BPF 程序（fd_install + sys_enter_close tracepoint + filp_close kprobe）。"""
         self._load_obj("fd", "fd.o")
         self._attach_kprobe("fd", "trace_fd_install", "fd_install")
-        self._attach_kprobe("fd", "trace_file_close_fd", "file_close_fd")
-        self._attach_kprobe("fd", "trace_filp_close", "filp_close")
+        self._attach_tp("fd", "trace_close_syscall", "syscalls", "sys_enter_close", optional=True)
+        self._attach_kprobe("fd", "trace_filp_close", "filp_close", optional=True)
         print("[loader] fd kprobes attached")
 
     def start_event_loop(self, callbacks):
@@ -584,6 +741,7 @@ class BpfLoader:
                         stats[pid] = {}
                     stats[pid][sid] = {
                         "alloc_bytes": int(val.alloc_bytes),
+                        "free_bytes": int(val.free_bytes),
                         "comm": val.comm.decode("utf-8", errors="replace"),
                         "stack_addrs": addrs,
                         "stack_cnt": scnt,
@@ -631,6 +789,26 @@ class BpfLoader:
                 if pid > 0 and not os.path.exists("/proc/%d" % pid):
                     dk = ctypes.c_uint(int(key.value))
                     dead_keys.append(dk)
+            ret = libbpf.bpf_map_get_next_key(fd, ctypes.byref(key), ctypes.byref(next_key))
+        for dk in dead_keys:
+            libbpf.bpf_map_delete_elem(fd, ctypes.byref(dk))
+        return len(dead_keys)
+
+    def clean_dead_pid_mmap_addr_map(self):
+        """清理 mmap_addr_map 中已退出进程的条目。"""
+        fd = self._get_map_fd("mem", b"mmap_addr_map")
+        if fd < 0:
+            return 0
+        key = MmapAddrKey()
+        next_key = MmapAddrKey()
+        dead_keys = []
+        ret = libbpf.bpf_map_get_next_key(fd, None, ctypes.byref(next_key))
+        while ret == 0:
+            ctypes.memmove(ctypes.byref(key), ctypes.byref(next_key), ctypes.sizeof(MmapAddrKey))
+            if not os.path.exists("/proc/%d" % key.pid):
+                dk = MmapAddrKey()
+                ctypes.memmove(ctypes.byref(dk), ctypes.byref(key), ctypes.sizeof(MmapAddrKey))
+                dead_keys.append(dk)
             ret = libbpf.bpf_map_get_next_key(fd, ctypes.byref(key), ctypes.byref(next_key))
         for dk in dead_keys:
             libbpf.bpf_map_delete_elem(fd, ctypes.byref(dk))

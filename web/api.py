@@ -23,10 +23,11 @@ def set_backend(b):
 def history():
     resource = request.args.get("resource", "mem")
     range_tag = request.args.get("range", "1d")
+    container_id = request.args.get("container_id")
     if _backend is not None:
-        return jsonify(_backend.get_history(resource, range_tag))
+        return jsonify(_backend.get_history(resource, range_tag, container_id))
     from mock import producer
-    return jsonify(producer.get_history(resource, range_tag))
+    return jsonify(producer.get_history(resource, range_tag, container_id))
 
 
 @api.route("/api/alerts")

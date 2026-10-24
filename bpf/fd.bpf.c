@@ -71,4 +71,15 @@ int trace_filp_close(struct pt_regs *ctx) {
     return 0;
 }
 
+SEC("tracepoint/syscalls/sys_enter_close")
+int trace_close_syscall(struct sys_enter_args *ctx) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    struct fd_count_key_t ckey = {.pid = (u64)pid};
+    struct fd_count_val_t *cval = bpf_map_lookup_elem(&fd_count_map, &ckey);
+    if (cval) {
+        __sync_fetch_and_add(&cval->close_count, 1);
+    }
+    return 0;
+}
+
 char _license[] SEC("license") = "GPL";

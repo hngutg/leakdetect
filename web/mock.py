@@ -51,13 +51,17 @@ class MockProducer:
             "name_regex": "",
             "pid_list": [],
         }
-        self.selected_container = None
+        self.selected_container = "all"
         self.container_pids = {
             "a3f4b2c1d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0": [1234],
             "b4e5c3d2e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1": [5678],
             "c5f6d4e3f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2": [9012],
             "d6a7e5f4a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3": [3456],
         }
+        self._pid_to_cname = {}
+        for c in self.containers:
+            for pid in self.container_pids.get(c["id"], []):
+                self._pid_to_cname[pid] = c["name"]
 
     def set_selected_container(self, cid):
         """设置当前选中的容器（None=全部）。"""
@@ -117,22 +121,44 @@ class MockProducer:
 
         alerts = self._generate_alerts(elapsed, now, mem_current, fd_current)
 
+        mmap_current = int(self.mem_base * 0.3 + elapsed * 1024 * 1024 / 120)
+
+        def _cname(pid):
+            return self._pid_to_cname.get(pid, "宿主机")
+        def _cid(pid):
+            for cid, pids in self.container_pids.items():
+                if pid in pids:
+                    return cid
+            return None
+
         per_process = {
             "mem": [
-                {"pid": 1234, "name": "nginx", "value": mem_current // 2, "delta_60s": 2097152},
-                {"pid": 5678, "name": "mysql", "value": mem_current // 4, "delta_60s": 0},
+                {"pid": 1234, "name": "nginx", "value": mem_current // 2, "delta_60s": 2097152,
+                 "container_id": _cid(1234), "container_name": _cname(1234)},
+                {"pid": 5678, "name": "mysql", "value": mem_current // 4, "delta_60s": 0,
+                 "container_id": _cid(5678), "container_name": _cname(5678)},
+            ],
+            "mmap": [
+                {"pid": 1234, "name": "nginx", "value": mmap_current // 2,
+                 "container_id": _cid(1234), "container_name": _cname(1234)},
             ],
             "thread": [
-                {"pid": 5678, "name": "mysql", "value": thread_current // 2},
-                {"pid": 9012, "name": "app", "value": thread_current // 3},
+                {"pid": 5678, "name": "mysql", "value": thread_current // 2,
+                 "container_id": _cid(5678), "container_name": _cname(5678)},
+                {"pid": 9012, "name": "app", "value": thread_current // 3,
+                 "container_id": _cid(9012), "container_name": _cname(9012)},
             ],
             "fd": [
-                {"pid": 9012, "name": "app", "value": fd_current // 2, "delta_60s": 12},
-                {"pid": 1234, "name": "nginx", "value": fd_current // 4, "delta_60s": 0},
+                {"pid": 9012, "name": "app", "value": fd_current // 2, "delta_60s": 12,
+                 "container_id": _cid(9012), "container_name": _cname(9012)},
+                {"pid": 1234, "name": "nginx", "value": fd_current // 4, "delta_60s": 0,
+                 "container_id": _cid(1234), "container_name": _cname(1234)},
             ],
             "cpu": [
-                {"pid": 1234, "name": "nginx", "value": round(cpu_current, 1)},
-                {"pid": 5678, "name": "mysql", "value": round(cpu_current * 0.7, 1)},
+                {"pid": 1234, "name": "nginx", "value": round(cpu_current, 1),
+                 "container_id": _cid(1234), "container_name": _cname(1234)},
+                {"pid": 5678, "name": "mysql", "value": round(cpu_current * 0.7, 1),
+                 "container_id": _cid(5678), "container_name": _cname(5678)},
             ],
         }
 
@@ -147,7 +173,7 @@ class MockProducer:
             if not self._is_filtered(a["pid"], a["process_name"])
         ]
 
-        if self.selected_container:
+        if self.selected_container and self.selected_container != "all":
             allowed_pids = self.container_pids.get(self.selected_container, [])
             for resource in per_process:
                 per_process[resource] = [
@@ -162,9 +188,10 @@ class MockProducer:
         return {
             "type": "dashboard_update",
             "timestamp": now,
-            "filter": {"container_id": None, "pid": None},
+            "filter": {"container_id": self.selected_container, "pid": None},
             "latest_points": {
                 "mem": {"t": now, "v": mem_current},
+                "mmap": {"t": now, "v": mmap_current},
                 "thread": {"t": now, "v": thread_current},
                 "fd": {"t": now, "v": fd_current},
                 "cpu": {"t": now, "v": round(cpu_current, 1)},
@@ -172,7 +199,37 @@ class MockProducer:
             "per_process": per_process,
             "alerts": alerts,
             "containers": self.containers,
+            "container_summary": self._container_summary(mem_current, mmap_current,
+                                                         thread_current, fd_current,
+                                                         cpu_current, alerts),
         }
+
+    def _container_summary(self, mem_cur, mmap_cur, thread_cur, fd_cur, cpu_cur, alerts):
+        """mock 容器概览聚合：按容器分配当前值，取最严重告警状态。"""
+        def _sev_rank(s):
+            return {"confirmed": 3, "suspected": 2}.get(s, 0)
+        sev_by_cid = {}
+        for a in alerts:
+            cid = a.get("container_id")
+            if _sev_rank(a["severity"]) > _sev_rank(sev_by_cid.get(cid, "normal")):
+                sev_by_cid[cid] = a["severity"]
+        result = [{
+            "id": None, "name": "宿主机", "sev": sev_by_cid.get(None, "normal"),
+            "mem": int(mem_cur * 0.1), "mmap": int(mmap_cur * 0.1),
+            "thread": max(1, thread_cur // 5), "fd": fd_cur // 5,
+            "cpu": round(cpu_cur * 0.2, 1), "pid_count": 3,
+        }]
+        frac = [0.4, 0.25, 0.15, 0.1]
+        for i, c in enumerate(self.containers):
+            f = frac[i] if i < len(frac) else 0.05
+            result.append({
+                "id": c["id"], "name": c["name"], "sev": sev_by_cid.get(c["id"], "normal"),
+                "mem": int(mem_cur * f), "mmap": int(mmap_cur * f),
+                "thread": max(1, int(thread_cur * f)), "fd": max(1, int(fd_cur * f)),
+                "cpu": round(cpu_cur * f, 1), "pid_count": c.get("pid_count", 1),
+            })
+        order = {"confirmed": 0, "suspected": 1, "normal": 2, "resolved": 3}
+        return sorted(result, key=lambda x: (order.get(x["sev"], 9), -x["mem"]))
 
     def _generate_alerts(self, elapsed, now, mem_current, fd_current):
         alerts = []
@@ -184,6 +241,8 @@ class MockProducer:
                 "pid": 1234,
                 "process_name": "nginx",
                 "severity": "confirmed",
+                "container_id": "a3f4b2c1d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0",
+                "container_name": "nginx-server",
                 "detail": "outstanding +%dMB in %ds" % (delta_mb, int(elapsed)),
                 "timestamp": now,
                 "stack": [
@@ -201,6 +260,8 @@ class MockProducer:
                 "pid": 9012,
                 "process_name": "app",
                 "severity": "suspected",
+                "container_id": "c5f6d4e3f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2",
+                "container_name": "app-worker",
                 "detail": "+%d FD in %ds" % (delta_fd, int(elapsed)),
                 "timestamp": now,
                 "stack": [
@@ -211,7 +272,7 @@ class MockProducer:
             })
         return alerts
 
-    def get_history(self, resource, range_tag="1d"):
+    def get_history(self, resource, range_tag="1d", container_id=None):
         now = int(time.time())
         ranges = {"1d": (86400, 60), "7d": (604800, 600), "30d": (2592000, 1800)}
         duration, interval = ranges.get(range_tag, ranges["1d"])

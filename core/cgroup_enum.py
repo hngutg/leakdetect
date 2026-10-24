@@ -25,6 +25,8 @@ class CgroupEnum:
         self._containers = []      # [{id, id_short, name, image, pids(set), cgroup_path}]
         self._host_pids = set()
         self._pid_cmdline = {}     # {pid: cmdline}（ps -ef CMD 风格，30s 刷新）
+        self._pid_to_cid = {}      # {pid: cid} 反查（O(1)），宿主进程无条目
+        self._cid_name = {}        # {cid: name} 反查
         self._refresh_interval = refresh_interval
         self._stop = threading.Event()
         self._thread = None
@@ -58,14 +60,36 @@ class CgroupEnum:
             } for c in self._containers]
 
     def target_pids(self, cid):
-        """cid=None → 宿主 PID 集；cid=X → 该容器 PID 集（找不到返回空集）。"""
+        """cid="all" → 宿主+所有容器 PID 并集；cid=None → 宿主 PID 集；
+        cid=X → 该容器 PID 集（找不到返回空集）。"""
         with self._lock:
+            if cid == "all":
+                allp = set(self._host_pids)
+                for c in self._containers:
+                    allp |= c["pids"]
+                return allp
             if cid is None:
                 return set(self._host_pids)
             for c in self._containers:
                 if c["id"] == cid:
                     return set(c["pids"])
             return set()
+
+    def pid_container(self, pid):
+        """返回 (cid, name)；宿主/未知进程返回 (None, "宿主机")。O(1) 反查。"""
+        with self._lock:
+            cid = self._pid_to_cid.get(pid)
+            if cid is None:
+                return None, "宿主机"
+            return cid, self._cid_name.get(cid, cid[:12] if cid else "宿主机")
+
+    def summary_pid_counts(self):
+        """返回 [(cid, name, pid_count)]，含宿主机 (None, "宿主机", count)。供概览聚合用。"""
+        with self._lock:
+            result = [(None, "宿主机", len(self._host_pids))]
+            for c in self._containers:
+                result.append((c["id"], c["name"], len(c["pids"])))
+            return result
 
     def _refresh(self):
         cid_pids = {}      # {cid: set(pids)}
@@ -104,6 +128,9 @@ class CgroupEnum:
             self._containers = containers
             self._host_pids = host_pids
             self._pid_cmdline = pid_cmdline
+            # 反查表（O(1) pid→cid / cid→name）
+            self._pid_to_cid = {p: c["id"] for c in containers for p in c["pids"]}
+            self._cid_name = {c["id"]: c["name"] for c in containers}
 
     def _read_container_cgroup(self, pid):
         """读 /proc/[pid]/cgroup，返回第一条含容器前缀的 cgroup path（已去尾斜杠）。"""

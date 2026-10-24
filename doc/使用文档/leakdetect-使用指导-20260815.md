@@ -287,6 +287,82 @@ sudo firewall-cmd --add-port=8080/tcp
 # 然后浏览器直接访问 http://<节点IP>:8080
 ```
 
+> 注记：若挡路的是跳板机↔节点之间的中间件（而非节点本机防火墙），步骤 3 无效——节点 iptables 本就开着、挡路的是中间件对 :8080 的 REJECT。此时改用下面的 C3。
+
+#### C3：跳板机作 SSH 客户端隧道（跳板与节点双禁转发、中间件只放 :22 时）
+
+**适用场景**（以下条件同时满足时用本方法，C1/C2 均失效）：
+- 本机不能直达目标节点（不同网段/无路由）。
+- 只能 `本机 → 跳板机 →（IPv6 :22）→ 目标节点` 两跳 SSH。
+- 跳板机 sshd `AllowTcpForwarding no`（C1 ProxyJump 报 `administratively prohibited`）。
+- 跳板机到目标节点**只有 :22 通**，:8080 被中间件 REJECT（`curl http://[节点IPv6]:8080` → `Connection refused`），且跳板机到节点 IPv4 无路由（`Network is unreachable`）。
+- **本机能访问跳板机的非 22 端口**（`Test-NetConnection <跳板IP> -Port 8080` = True）——本方法成立的关键前提。
+
+**现象**：浏览器直访节点 8080 超时/拒绝；C1/C2 的 `ssh -L/-J` 都报 `administratively prohibited: open failed`。
+
+**原因**：
+- 跳板机 sshd 禁转发 → 跳板机**当转发服务端**的一切 `-L/-R/-J` 都被拒。
+- 中间件把跳板机→节点的 :8080 封了（只放 :22）→ 在跳板机上直接中继到节点:8080 也连不上。
+- 结论：到节点的流量**必须塞进 :22 SSH**，且转发不能由跳板机 sshd 承担。
+
+**解决思路**：让**跳板机当 ssh 客户端**（不是 sshd 服务端）。`ssh -L` 的本地监听是客户端行为，不受跳板机 sshd 的 `AllowTcpForwarding` 管；转发的远端目标由**目标节点 sshd** 完成，落在节点本机 `127.0.0.1:8080`，绕开中间件对节点 :8080 的封锁。再利用"本机能到跳板机非22端口"，浏览器直连 `跳板IP:18080`。
+
+**步骤**：
+
+1. 目标节点开转发（你是 root；只动这台节点，不碰跳板机）：
+```bash
+cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.$(date +%F-%H%M)
+# 把 AllowTcpForwarding no 改成 yes，只改这一个关键字
+sshd -t && systemctl reload sshd     # reload 不断当前连接
+```
+
+2. 跳板机起隧道（普通用户即可，不用 sudo；窗口保持开着）：
+```bash
+ssh -N -L 0.0.0.0:18080:127.0.0.1:8080 <目标user>@<节点IPv6>
+# -N：不开 shell 只做转发，"卡住无输出"是正常，隧道在跑
+# 0.0.0.0:18080：跳板机所有网卡 18080（本机浏览器连 跳板IP:18080）
+# 127.0.0.1:8080：转发到目标节点本机回环 8080
+```
+
+3. 本机浏览器：
+```
+http://<跳板IP>:18080
+```
+
+**数据路径**：
+```
+本机浏览器 → 跳板IP:18080 → 跳板机 ssh 客户端监听
+            → 走 :22 隧道到目标节点 sshd → 节点本机 127.0.0.1:8080 → app
+```
+中间件全程只看到 :22 流量，绕开了对节点 :8080 的封锁；也没碰跳板机 sshd。
+
+**前提自检（只读）**：
+```bash
+# 本机（PowerShell）：能到跳板机非22端口？必须 True
+Test-NetConnection -ComputerName <跳板IP> -Port 8080
+# 跳板机：到节点 IPv6 :22 通、:8080 被拒（预期，本方法绕开它）
+ssh <节点user>@<节点IPv6> 'echo ok'
+curl --max-time 5 http://[<节点IPv6>]:8080/        # Connection refused
+# 目标节点：app 听着、本机回环通
+ss -tlnp | grep 8080
+curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/   # 200
+```
+
+**验证隧道**（跳板机另开窗口）：
+```bash
+curl -sS -o /dev/null -w 'tunnel=%{http_code}\n' http://127.0.0.1:18080/   # 200 即通
+```
+
+**回退**：
+```bash
+# 1. 跳板机：关隧道（ssh -N 窗口 Ctrl+C，或 pkill -f 'ssh -N -L 0.0.0.0:18080'）
+# 2. 目标节点：还原 sshd
+cp /etc/ssh/sshd_config.bak.<时间戳> /etc/ssh/sshd_config
+sshd -t && systemctl reload sshd
+```
+
+**为什么改节点不改跳板机**：跳板机通常是 PaaS/网管节点，动 sshd 风险高；目标节点是自己的 leakdetect 测试机，有 root、风险低、可回退。`AllowTcpForwarding yes` 只表示允许经此 sshd 转发，不等于开放公网登录；且节点本就在内网、只对跳板机可达（中间件只放 :22），暴露面无实质扩大。
+
 ### 5.4 端口/防火墙检查
 
 ```bash
@@ -489,6 +565,7 @@ channel 0: open failed: administratively prohibited: open failed
 - 方案 1：在目标节点开放 8080 端口 → 浏览器直接访问 `http://<节点IP>:8080`
 - 方案 2：找管理员开 `AllowTcpForwarding yes`
 - 方案 3：用 `socat` 转发到其他可达端口
+- 方案 4（跳板与节点双禁转发 + 中间件只放 :22 + 本机能到跳板非22端口）：见 5.3 C3——跳板机当 ssh 客户端、节点开 `AllowTcpForwarding`、`ssh -N -L 0.0.0.0:18080:127.0.0.1:8080`。
 
 ### Q8：dup2 tracepoint WARNING
 
